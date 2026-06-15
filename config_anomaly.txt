@@ -1,0 +1,266 @@
+"""
+
+Anomaly Detection 専用設定
+
+- 機台 × ROUTE_KEY × Deployment ID を管理
+
+- スクリプト本体には機台番号を直書きしない
+
+"""
+
+ 
+
+from config import ANOMALY_SAVE_DIR
+
+ 
+
+# ==========================================
+
+# View / Status
+
+# ==========================================
+
+ANOMALY_PENDING_VIEW = "dbo.v_Pending_AnomalyDetect_001"
+
+ANOMALY_STATUS_TABLE = "dbo.Status_AnomalyDetect"
+
+# 全量履歴特徴量ビュー (View1)。View2 (pending) とは異なり、過去全件のセンサー実測値を保持する。
+
+# Explanation Trend Graph の右軸（特徴量物理値推移）のデータソースとして使用。
+
+ANOMALY_HISTORICAL_FEATURE_VIEW = "dbo.v_AnomalyDetect_FeatureHistory"
+
+
+ 
+
+# ==========================================
+
+# Batch Prediction Settings
+
+# ==========================================
+
+BATCH_SIZE = 1000
+
+MAX_EXPLANATIONS = 3
+
+ 
+
+# ==========================================
+
+# Machine_No × ROUTE_KEY → Deployment
+
+# ==========================================
+
+DEPLOYMENT_CONFIG = {
+
+    (311, "BandA_BeltA"): {
+
+        "deployment_key": "DEPLOY_311_BAND_A__BELT_A",
+
+        "deployment_id": "6a13a4f5dfa8b80bf2425b9f",
+
+    },
+
+    (311, "BandA_BeltB"): {
+
+        "deployment_key": "DEPLOY_311_BAND_A__BELT_B",
+
+        "deployment_id": "6a13a4ee63b39542a74263e5",
+
+    },
+
+    (311, "BandB_BeltA"): {
+
+        "deployment_key": "DEPLOY_311_BAND_B__BELT_A",
+
+        "deployment_id": "6a13a522dfa8b80bf2425c27",
+
+    },
+
+    (311, "BandB_BeltB"): {
+
+        "deployment_key": "DEPLOY_311_BAND_B__BELT_B",
+
+        "deployment_id": "6a13a4f22ee19d918cf5dda8",
+
+    },
+
+}
+
+ 
+
+# ==========================================
+
+# Status
+
+# ==========================================
+
+STATUS_SUCCESS = "SUCCESS"
+
+STATUS_ERROR = "ERROR"
+
+STATUS_SKIPPED_NO_MODEL = "SKIPPED_NO_MODEL"
+
+STATUS_SKIPPED_INVALID_ROUTE = "SKIPPED_INVALID_ROUTE"
+
+ 
+
+ 
+
+MAX_WORKERS = 1
+
+ 
+
+ 
+
+# ==========================================
+
+# Anomaly judgment settings
+
+# ==========================================
+
+ 
+
+# 旧007 Rule 1: 単点異常
+
+ANOMALY_UCL = 0.85
+
+ 
+
+# 旧007 Rule 2 の前段階：警戒レベル
+
+# ※ 連続5点判定は第2回以降で実装
+
+ANOMALY_UWL = 0.70
+
+ 
+
+# 今回はまだ使わないが、後続用に定義だけしておく
+
+ANOMALY_RULE2_WINDOW = 5
+
+ANOMALY_SPC_SIGMA = 3.0
+
+ANOMALY_SPC_MIN_STD = 0.5
+
+ 
+
+ENABLE_SPC_RULE = False
+
+ENABLE_EXCEL_REPORT = False
+
+ENABLE_AI_DIAGNOSIS = False
+
+ 
+
+# ==========================================
+
+# Sensor fault settings
+
+# ==========================================
+
+ 
+
+ 
+
+DISABLED_ANOMALY_FEATURES = {
+
+    "Band_drum_Circ_Act_Std",
+
+}
+
+ 
+
+# 修理中センサーを列ごと削除しない
+
+EXCLUDE_DISABLED_FEATURES_FROM_PREDICTION = False
+
+ 
+
+# 修理中センサーの値だけNULLにしてDataRobotへ送る
+
+NULL_DISABLED_FEATURES_FOR_PREDICTION = True
+
+ 
+
+# NULLでもExplanationに残った場合の保険
+
+ENABLE_SENSOR_FAULT_SUPPRESSION = True
+
+ 
+
+ 
+
+# ==========================================
+
+# Explanation Trend Graph Settings
+
+# ==========================================
+
+# WARNING / ANOMALY 発生時に、対象時刻の前後範囲で
+
+# anomaly_score と Top Explanation 該当特徴量の実測値推移を画像出力する。
+
+# 初期値は前後±2時間。今後の運用変更を想定し、分単位で変更する。
+
+ENABLE_EXPLANATION_TREND_GRAPH = True
+
+ 
+
+# 対象イベント時刻の何分前から見るか。初期値: 120分 = 2時間
+
+EXPLANATION_TREND_WINDOW_MINUTES_BEFORE = 120
+
+ 
+
+# 対象イベント時刻の何分後まで見るか。初期値: 120分 = 2時間
+
+EXPLANATION_TREND_WINDOW_MINUTES_AFTER = 120
+
+ 
+
+# グラフ作成対象ステータス
+
+# TREND_ANOMALY は現行スクリプトのRule2判定が存在するため対象に含める。
+
+EXPLANATION_TREND_TARGET_STATUSES = [
+
+    "ANOMALY",
+
+    "TREND_ANOMALY",
+
+    "WARNING",
+
+    "SENSOR_FAULT_SUPPRESSED",
+
+]
+
+ 
+
+# 1回の実行で作成する最大イベント数。
+
+# WARNING大量発生時の画像肥大化を防ぐため、異常スコア上位から制限する。
+
+EXPLANATION_TREND_MAX_EVENTS = 20
+
+ 
+
+# グラフ出力サブフォルダ名。config.ANOMALY_SAVE_DIR 配下に作成する。
+
+EXPLANATION_TREND_OUTPUT_SUBDIR = "explanation_trend_graphs"
+
+ 
+
+# ==========================================
+
+# Mail Settings (Anomaly専用)
+
+# ==========================================
+
+ 
+
+ANOMALY_MAIL_TO = ""
+
+ANOMALY_MAIL_CC = ""
+
+ANOMALY_MAIL_ENABLE = 1

@@ -1,0 +1,2586 @@
+
+# -*- coding: utf-8 -*-
+
+"""
+
+AnomalyDetect_new.py
+
+
+
+目的:
+
+- SQL Server の dbo.v_Pending_AnomalyDetect_001 から未処理データを取得
+
+- Machine_No × ROUTE_KEY ごとに DataRobot Deployment へルーティング
+
+- モデルが無い機台は SKIPPED_NO_MODEL として記録
+
+- 予測成功/失敗を dbo.Status_AnomalyDetect に記録
+
+- DataRobot リアルタイム予測で ANOMALY_SCORE と Explanation を取得
+
+- 固定閾値で一次判定する
+
+- 旧007 Rule2: anomaly_score >= UWL が連続5点続いた場合 TREND_ANOMALY とする
+
+- 修理中センサーは列削除せず、DataRobot予測直前に値だけNULL化する
+
+- 修理中センサーがTop Explanationに残った場合は設備異常判定を抑制する
+
+- 全件NORMALならCSVを出さない
+
+- 各処理の所要時間をコンソールとファイルログに出力
+
+"""
+
+
+
+from __future__ import annotations
+
+
+
+import os
+
+import time
+
+import traceback
+
+import threading
+
+from datetime import datetime
+
+from typing import Dict, List
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+
+# ==========================================
+
+# 0. Proxy Settings
+
+# ==========================================
+
+
+
+# PROXY_URL = "http://172.24.168.106:8080"
+
+
+
+# Disable forced proxy environment variable settings to avoid 407 Proxy Authentication Required
+
+# during DataRobot connections. Uncomment for troubleshooting or to re-enable fixed proxy.
+
+# os.environ["HTTP_PROXY"] = PROXY_URL
+
+# os.environ["HTTPS_PROXY"] = PROXY_URL
+
+# os.environ["http_proxy"] = PROXY_URL
+
+# os.environ["https_proxy"] = PROXY_URL
+
+
+
+# PROXIES = {
+
+#     "http": PROXY_URL,
+
+#     "https": PROXY_URL,
+
+# }
+
+
+
+import pandas as pd
+
+import pyodbc
+
+import datarobot as dr
+
+from datarobot_predict.deployment import predict
+
+
+
+import config
+
+import config_anomaly
+
+
+
+# ==========================================
+
+# 1. Config
+
+# ==========================================
+
+
+
+SQL_CONN_STR = config.SQL_CONFIG
+
+DATAROBOT_API_TOKEN = config.API_TOKEN
+
+
+
+VIEW_NAME = config_anomaly.ANOMALY_PENDING_VIEW
+
+STATUS_TABLE = config_anomaly.ANOMALY_STATUS_TABLE
+
+ANOMALY_HISTORICAL_FEATURE_VIEW = config_anomaly.ANOMALY_HISTORICAL_FEATURE_VIEW
+
+
+
+BATCH_SIZE = config_anomaly.BATCH_SIZE
+
+DEPLOYMENT_CONFIG = config_anomaly.DEPLOYMENT_CONFIG
+
+MAX_EXPLANATIONS = config_anomaly.MAX_EXPLANATIONS
+
+
+
+ANOMALY_UCL = getattr(config_anomaly, "ANOMALY_UCL", 0.85)
+
+ANOMALY_UWL = getattr(config_anomaly, "ANOMALY_UWL", 0.70)
+
+
+
+ANOMALY_RULE2_WINDOW = getattr(config_anomaly, "ANOMALY_RULE2_WINDOW", 5)
+
+ANOMALY_SPC_SIGMA = getattr(config_anomaly, "ANOMALY_SPC_SIGMA", 3.0)
+
+ANOMALY_SPC_MIN_STD = getattr(config_anomaly, "ANOMALY_SPC_MIN_STD", 0.5)
+
+
+
+ENABLE_SPC_RULE = getattr(config_anomaly, "ENABLE_SPC_RULE", False)
+
+ENABLE_EXCEL_REPORT = getattr(config_anomaly, "ENABLE_EXCEL_REPORT", False)
+
+ENABLE_AI_DIAGNOSIS = getattr(config_anomaly, "ENABLE_AI_DIAGNOSIS", False)
+
+
+
+DISABLED_ANOMALY_FEATURES = set(
+    getattr(config_anomaly, "DISABLED_ANOMALY_FEATURES", set())
+)
+
+
+
+# Trueにすると列自体をDataRobotへ送らない。
+
+# 今回はFalse推奨。列削除すると missing_columns になるため。
+
+EXCLUDE_DISABLED_FEATURES_FROM_PREDICTION = getattr(
+    config_anomaly,
+    "EXCLUDE_DISABLED_FEATURES_FROM_PREDICTION",
+    False,
+)
+
+
+
+# Trueにすると、修理中センサー列は残したまま値だけNoneにする。
+
+NULL_DISABLED_FEATURES_FOR_PREDICTION = getattr(
+    config_anomaly,
+    "NULL_DISABLED_FEATURES_FOR_PREDICTION",
+    False,
+)
+
+
+
+ENABLE_SENSOR_FAULT_SUPPRESSION = getattr(
+    config_anomaly,
+    "ENABLE_SENSOR_FAULT_SUPPRESSION",
+    True,
+)
+
+
+
+# DataRobotへ送らない管理列
+
+# 注意:
+
+# Band_drum_Circ_Act-Std はここに直書きしない。
+
+# 今回は列削除ではなく、値だけNULL化する。
+
+EXCLUDE_COLUMNS = {
+    "Band_drum_Drum_No_Act",
+    "Belt_drum_Drum_No_Act",
+    "ROUTE_KEY",
+}
+
+
+
+# ログ
+
+LOG_LOCK = threading.Lock()
+
+os.makedirs(config.LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(
+    config.LOG_DIR,
+    f"Log_AnomalyDetect_{datetime.now().strftime('%Y%m%d')}.txt",
+)
+
+# ==========================================
+
+# Mail Settings
+
+# ==========================================
+
+
+
+ANOMALY_MAIL_ENABLE = getattr(
+    config_anomaly,
+    "ANOMALY_MAIL_ENABLE",
+    1,
+)
+
+
+
+ANOMALY_MAIL_TO = getattr(
+    config_anomaly,
+    "ANOMALY_MAIL_TO",
+    "",
+)
+
+
+
+ANOMALY_MAIL_CC = getattr(
+    config_anomaly,
+    "ANOMALY_MAIL_CC",
+    "",
+)
+
+
+
+# ==========================================
+
+# Explanation Trend Graph Settings
+
+# ==========================================
+
+
+
+ENABLE_EXPLANATION_TREND_GRAPH = getattr(
+    config_anomaly,
+    "ENABLE_EXPLANATION_TREND_GRAPH",
+    True,
+)
+
+
+
+EXPLANATION_TREND_WINDOW_MINUTES_BEFORE = getattr(
+    config_anomaly,
+    "EXPLANATION_TREND_WINDOW_MINUTES_BEFORE",
+    120,
+)
+
+
+
+EXPLANATION_TREND_WINDOW_MINUTES_AFTER = getattr(
+    config_anomaly,
+    "EXPLANATION_TREND_WINDOW_MINUTES_AFTER",
+    120,
+)
+
+
+
+EXPLANATION_TREND_TARGET_STATUSES = getattr(
+    config_anomaly,
+    "EXPLANATION_TREND_TARGET_STATUSES",
+    ["ANOMALY", "TREND_ANOMALY", "WARNING", "SENSOR_FAULT_SUPPRESSED"],
+)
+
+
+
+EXPLANATION_TREND_MAX_EVENTS = getattr(
+    config_anomaly,
+    "EXPLANATION_TREND_MAX_EVENTS",
+    20,
+)
+
+
+
+EXPLANATION_TREND_OUTPUT_SUBDIR = getattr(
+    config_anomaly,
+    "EXPLANATION_TREND_OUTPUT_SUBDIR",
+    "explanation_trend_graphs",
+)
+
+
+
+# ==========================================
+
+# 2. Logging
+
+# ==========================================
+
+ 
+
+ 
+
+def log_message(message: str) -> None:
+
+    """
+
+    コンソールとファイルの両方にログ出力。
+
+    """
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    line = f"[{timestamp}] {message}"
+
+ 
+
+    print(line)
+
+ 
+
+    try:
+
+        with LOG_LOCK:
+
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+
+                f.write(line + "\n")
+
+    except Exception as e:
+
+        print(f"[LOGGER_ERROR] {e}")
+
+ 
+
+ 
+
+def log_elapsed(message: str, start_time: float) -> None:
+
+    """
+
+    所要時間付きログ。
+
+    """
+
+    elapsed = time.perf_counter() - start_time
+
+    log_message(f"{message} elapsed={elapsed:.2f}s")
+
+ 
+
+ 
+
+# ==========================================
+
+# 3. SQL Utility
+
+# ==========================================
+
+ 
+
+ 
+
+def get_connection() -> pyodbc.Connection:
+
+    return pyodbc.connect(SQL_CONN_STR)
+
+ 
+
+ 
+
+def fetch_pending_data() -> pd.DataFrame:
+
+    t0 = time.perf_counter()
+
+ 
+
+    sql = f"""
+
+    SELECT TOP 100 *
+
+    FROM {VIEW_NAME}
+
+    ORDER BY Production_DateTime DESC;
+
+    """
+
+ 
+
+    log_message("[SQL] start fetch pending data")
+
+ 
+
+    with get_connection() as conn:
+
+        df = pd.read_sql(sql, conn)
+
+ 
+
+    log_elapsed(f"[SQL] finish fetch pending data rows={len(df)}", t0)
+
+ 
+
+    return df
+
+ 
+
+ 
+
+def insert_status_rows(rows: List[dict]) -> None:
+
+  if not rows:
+
+    return
+
+  t0 = time.perf_counter()
+
+  # INSERT ... WHERE NOT EXISTS で1行ずつのSELECTによるO(N)ポーリングを排除し、
+  # cur.executemany + fast_executemany=True による一括高速挿入を実現する。
+  # 重複行はDB側で黙ってスキップされる。
+  insert_sql = f"""
+  INSERT INTO {STATUS_TABLE} (
+    Machine_No,
+    Product_No_TBM,
+    Production_DateTime,
+    Serial_No_TBM,
+    status,
+    message,
+    anomaly_score,
+    judgment,
+    trigger_rule,
+    deployment_key,
+    route_key,
+    top_explanation,
+    processed_at
+  )
+  SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSDATETIME()
+  WHERE NOT EXISTS (
+    SELECT 1 FROM {STATUS_TABLE}
+    WHERE Machine_No = ? AND Product_No_TBM = ? AND Production_DateTime = ?
+      AND Serial_No_TBM = ? AND route_key = ?
+  )
+  """
+
+  # パラメータリスト: VALUES用12個 + WHERE NOT EXISTS用5個 = 17個/行
+  insert_params = []
+  for r in rows:
+    params = (
+      # VALUES parameters (12)
+      r.get("Machine_No"),
+      r.get("Product_No_TBM"),
+      r.get("Production_DateTime"),
+      r.get("Serial_No_TBM"),
+      r.get("status"),
+      r.get("message"),
+      r.get("anomaly_score"),
+      r.get("judgment"),
+      r.get("trigger_rule"),
+      r.get("deployment_key"),
+      r.get("route_key"),
+      r.get("top_explanation"),
+      # WHERE NOT EXISTS key parameters (5)
+      r.get("Machine_No"),
+      r.get("Product_No_TBM"),
+      r.get("Production_DateTime"),
+      r.get("Serial_No_TBM"),
+      r.get("route_key"),
+    )
+    insert_params.append(params)
+
+  try:
+    with get_connection() as conn:
+      cur = conn.cursor()
+      cur.fast_executemany = True
+      cur.executemany(insert_sql, insert_params)
+      conn.commit()
+      log_elapsed(
+        f"[SQL] insert status rows attempted={len(rows)} "
+        f"(duplicates silently skipped via WHERE NOT EXISTS)",
+        t0,
+      )
+
+  except Exception as e:
+    log_message(f"[SQL] insert_status_rows failed:
+" + traceback.format_exc())
+    raise
+
+
+def validate_required_columns(df: pd.DataFrame) -> None:
+
+    required = [
+
+        "Machine_No",
+
+        "Product_No_TBM",
+
+        "Production_DateTime",
+
+        "Serial_No_TBM",
+
+        "ROUTE_KEY",
+
+    ]
+
+ 
+
+    missing = [c for c in required if c not in df.columns]
+
+ 
+
+    if missing:
+
+        raise ValueError(f"必須列不足: {missing}")
+
+ 
+
+ 
+
+def split_by_routing(df: pd.DataFrame) -> Dict[tuple, pd.DataFrame]:
+
+    """
+
+    Machine_No × ROUTE_KEY でDeploymentを選ぶ。
+
+    モデルが存在しない機台は SKIPPED_NO_MODEL として記録する。
+
+    """
+
+    t0 = time.perf_counter()
+
+ 
+
+    validate_required_columns(df)
+
+ 
+
+    df = df.copy()
+
+    routed: Dict[tuple, pd.DataFrame] = {}
+
+ 
+
+    df["Machine_No_key"] = pd.to_numeric(df["Machine_No"], errors="coerce").astype(
+
+        "Int64"
+
+    )
+
+ 
+
+    valid_route_keys = {route_key for (_, route_key) in DEPLOYMENT_CONFIG.keys()}
+
+ 
+
+    invalid_df = df[
+
+        df["Machine_No_key"].isna() | ~df["ROUTE_KEY"].isin(valid_route_keys)
+
+    ].copy()
+
+ 
+
+    if not invalid_df.empty:
+
+        invalid_rows = []
+
+ 
+
+        for _, row in invalid_df.iterrows():
+
+            invalid_rows.append(
+
+                {
+
+                    "Machine_No": row.get("Machine_No"),
+
+                    "Product_No_TBM": row.get("Product_No_TBM"),
+
+                    "Production_DateTime": row.get("Production_DateTime"),
+
+                    "Serial_No_TBM": row.get("Serial_No_TBM"),
+
+                    "status": "SKIPPED_INVALID_ROUTE",
+
+                    "message": (
+
+                        f"invalid Machine_No={row.get('Machine_No')}, "
+
+                        f"ROUTE_KEY={row.get('ROUTE_KEY')}"
+
+                    ),
+
+                    "anomaly_score": None,
+
+                    "judgment": "SKIPPED_INVALID_ROUTE",
+
+                    "trigger_rule": "INVALID_ROUTE",
+
+                    "deployment_key": None,
+
+                    "route_key": row.get("ROUTE_KEY"),
+
+                    "top_explanation": None,
+
+                }
+
+            )
+
+ 
+
+        insert_status_rows(invalid_rows)
+
+ 
+
+    valid_df = df[
+
+        df["Machine_No_key"].notna() & df["ROUTE_KEY"].isin(valid_route_keys)
+
+    ].copy()
+
+ 
+
+    skipped_no_model_rows = []
+
+ 
+
+    for (machine_no, route_key), sub_df in valid_df.groupby(
+
+        ["Machine_No_key", "ROUTE_KEY"], dropna=False
+
+    ):
+
+        model_key = (int(machine_no), route_key)
+
+ 
+
+        if model_key not in DEPLOYMENT_CONFIG:
+
+            for _, row in sub_df.iterrows():
+
+                skipped_no_model_rows.append(
+
+                    {
+
+                        "Machine_No": row.get("Machine_No"),
+
+                        "Product_No_TBM": row.get("Product_No_TBM"),
+
+                        "Production_DateTime": row.get("Production_DateTime"),
+
+                        "Serial_No_TBM": row.get("Serial_No_TBM"),
+
+                        "status": "SKIPPED_NO_MODEL",
+
+                        "message": (
+
+                            f"no model for Machine_No={row.get('Machine_No')}, "
+
+                            f"ROUTE_KEY={row.get('ROUTE_KEY')}"
+
+                        ),
+
+                        "anomaly_score": None,
+
+                        "judgment": "SKIPPED_NO_MODEL",
+
+                        "trigger_rule": "NO_DEPLOYMENT_MODEL",
+
+                        "deployment_key": None,
+
+                        "route_key": row.get("ROUTE_KEY"),
+
+                        "top_explanation": None,
+
+                    }
+
+                )
+
+            continue
+
+ 
+
+        sub_df = sub_df.drop(columns=["Machine_No_key"])
+
+        routed[model_key] = sub_df.copy()
+
+ 
+
+    if skipped_no_model_rows:
+
+        insert_status_rows(skipped_no_model_rows)
+
+ 
+
+    log_elapsed(
+
+        f"[ROUTING] finish routed_groups={len(routed)} "
+
+        f"skipped_no_model={len(skipped_no_model_rows)} "
+
+        f"invalid_route={len(invalid_df)}",
+
+        t0,
+
+    )
+
+ 
+
+    return routed
+
+ 
+
+ 
+
+# ==========================================
+
+# 4.5 Anomaly Judgment / Feature Control
+
+# ==========================================
+
+ 
+
+ 
+
+def normalize_feature_name(name: str | None) -> str:
+
+    """
+
+    DataRobot返却名とSQL列名の表記ゆれを吸収する。
+
+    例:
+
+    Band_drum_Circ_Act-Std
+
+    Band_drum_Circ_Act_Std
+
+    """
+
+    if name is None:
+
+        return ""
+
+ 
+
+    return str(name).strip().replace("-", "_")
+
+ 
+
+ 
+
+def is_disabled_feature(feature_name: str | None) -> bool:
+
+    """
+
+    修理中・信頼不可センサーか判定する。
+
+    """
+
+    target = normalize_feature_name(feature_name)
+
+ 
+
+    disabled_normalized = {normalize_feature_name(x) for x in DISABLED_ANOMALY_FEATURES}
+
+ 
+
+    return target in disabled_normalized
+
+ 
+
+ 
+
+def is_prediction_excluded_column(col_name: str) -> bool:
+
+    """
+
+    DataRobot予測入力から除外する列か判定する。
+
+    """
+
+    if col_name in EXCLUDE_COLUMNS:
+
+        return True
+
+ 
+
+    if not EXCLUDE_DISABLED_FEATURES_FROM_PREDICTION:
+
+        return False
+
+ 
+
+    return is_disabled_feature(col_name)
+
+ 
+
+ 
+
+def find_anomaly_score_column(df: pd.DataFrame) -> str:
+
+    """
+
+    DataRobot予測結果から anomaly score 列を特定する。
+
+    """
+
+    candidates = [
+
+        "ANOMALY_SCORE",
+
+        "anomaly_score",
+
+        "Anomaly Score",
+
+        "prediction",
+
+        "Prediction",
+
+    ]
+
+ 
+
+    for col in candidates:
+
+        if col in df.columns:
+
+            return col
+
+ 
+
+    raise ValueError(f"anomaly score列が見つかりません。予測結果列={list(df.columns)}")
+
+ 
+
+ 
+
+def judge_by_fixed_threshold(score) -> tuple[str, str]:
+
+    """
+
+    旧007の固定閾値思想に基づく一次判定。
+
+ 
+
+    注意:
+
+    anomaly_score がNULL/数値化不可の場合は、通信障害ではなく
+
+    DataRobot返却値または入力データ起因の不正として ERROR_DATA に分類する。
+
+    """
+
+    if pd.isna(score):
+
+        return "ERROR_DATA", "SCORE_NULL"
+
+ 
+
+    score = float(score)
+
+ 
+
+    if score >= ANOMALY_UCL:
+
+        return "ANOMALY", "RULE1_UCL"
+
+ 
+
+    if score >= ANOMALY_UWL:
+
+        return "WARNING", "RULE0_UWL"
+
+ 
+
+    return "NORMAL", "RULE0_NORMAL"
+
+ 
+
+ 
+
+def get_explanation_feature_columns(row: pd.Series) -> list[str]:
+
+    """
+
+    EXPLANATION_1_FEATURE_NAME, EXPLANATION_2_FEATURE_NAME...
+
+    を番号順に取得する。
+
+    """
+
+    cols = [
+
+        c
+
+        for c in row.index
+
+        if "EXPLANATION" in str(c).upper() and "FEATURE_NAME" in str(c).upper()
+
+    ]
+
+ 
+
+    def sort_key(col):
+
+        text = str(col)
+
+        parts = text.split("_")
+
+        for p in parts:
+
+            if p.isdigit():
+
+                return int(p)
+
+        return 999
+
+ 
+
+    return sorted(cols, key=sort_key)
+
+ 
+
+ 
+
+def extract_first_explanation_feature(row: pd.Series) -> str | None:
+
+    """
+
+    DataRobot Explanationの最上位特徴量を取得する。
+
+    """
+
+    for col in get_explanation_feature_columns(row):
+
+        value = row.get(col)
+
+ 
+
+        if pd.notna(value) and str(value).strip():
+
+            return str(value).strip()[:500]
+
+ 
+
+    return None
+
+ 
+
+ 
+
+def extract_top_explanation(row: pd.Series) -> str | None:
+
+    """
+
+    表示・保存用のTop Explanation。
+
+    修理中センサーは除外し、次のExplanationを採用する。
+
+    """
+
+    for col in get_explanation_feature_columns(row):
+
+        value = row.get(col)
+
+ 
+
+        if pd.isna(value):
+
+            continue
+
+ 
+
+        feature_name = str(value).strip()
+
+ 
+
+        if not feature_name:
+
+            continue
+
+ 
+
+        if is_disabled_feature(feature_name):
+
+            continue
+
+ 
+
+        return feature_name[:500]
+
+ 
+
+    return None
+
+ 
+
+ 
+
+def apply_sensor_fault_suppression(df: pd.DataFrame) -> pd.DataFrame:
+
+    """
+
+    修理中センサーがTop Explanationに残った場合、
+
+    設備異常判定を抑制する。
+
+    """
+
+    if not ENABLE_SENSOR_FAULT_SUPPRESSION:
+
+        return df
+
+ 
+
+    df = df.copy()
+
+ 
+
+    df["top_explanation_raw"] = df.apply(
+
+        extract_first_explanation_feature,
+
+        axis=1,
+
+    )
+
+ 
+
+    df["suppressed_feature"] = df["top_explanation_raw"].apply(
+
+        lambda x: x if is_disabled_feature(x) else None
+
+    )
+
+ 
+
+    suppress_mask = df["suppressed_feature"].notna() & df["judgment"].isin(
+
+        ["WARNING", "ANOMALY", "TREND_ANOMALY"]
+
+    )
+
+ 
+
+    df.loc[suppress_mask, "judgment"] = "SENSOR_FAULT_SUPPRESSED"
+
+    df.loc[suppress_mask, "trigger_rule"] = "DISABLED_FEATURE_TOP_EXPLANATION"
+
+ 
+
+    return df
+
+ 
+
+ 
+
+def add_judgment_columns(pred_df: pd.DataFrame) -> pd.DataFrame:
+
+    """
+
+    DataRobot予測結果に
+
+    anomaly_score / judgment / trigger_rule / top_explanation
+
+    を追加する。
+
+    """
+
+    df = pred_df.copy()
+
+ 
+
+    score_col = find_anomaly_score_column(df)
+
+ 
+
+    df["anomaly_score"] = pd.to_numeric(df[score_col], errors="coerce")
+
+ 
+
+    judgments = df["anomaly_score"].apply(judge_by_fixed_threshold)
+
+ 
+
+    df["judgment"] = judgments.apply(lambda x: x[0])
+
+    df["trigger_rule"] = judgments.apply(lambda x: x[1])
+
+ 
+
+    df["top_explanation"] = df.apply(extract_top_explanation, axis=1)
+
+ 
+
+    df = apply_sensor_fault_suppression(df)
+
+ 
+
+    return df
+
+ 
+
+ 
+
+
+
+def _fetch_historical_scores(machine_no, route_key, limit: int) -> pd.DataFrame:
+  """
+  Machine_No × ROUTE_KEY について、dbo.Status_AnomalyDetect から
+  直近 limit 件の anomaly_score を Production_DateTime 降順で取得し、
+  昇順（時系列順）に並べ直して返す。
+  """
+  if machine_no is None or pd.isna(machine_no) or route_key is None or pd.isna(route_key):
+    return pd.DataFrame()
+
+  sql = f"""
+  SELECT TOP {int(limit)} anomaly_score, Production_DateTime
+  FROM {STATUS_TABLE}
+  WHERE Machine_No = ? AND route_key = ?
+    AND anomaly_score IS NOT NULL
+  ORDER BY Production_DateTime DESC
+  """
+
+  try:
+    with get_connection() as conn:
+      df = pd.read_sql(sql, conn, params=[machine_no, route_key])
+    if df.empty:
+      return pd.DataFrame()
+    # 昇順（時系列順）に整列
+    df = df.sort_values("Production_DateTime").reset_index(drop=True)
+    return df
+  except Exception as e:
+    log_message(
+      f"[RULE2] failed to fetch historical scores "
+      f"Machine_No={machine_no} ROUTE_KEY={route_key}: {e}"
+    )
+    return pd.DataFrame()
+def apply_rule2_consecutive_uwl(pred_df: pd.DataFrame) -> pd.DataFrame:
+  """
+  旧007 Rule2（クロスバッチ対応版）:
+  anomaly_score >= ANOMALY_UWL が連続 ANOMALY_RULE2_WINDOW 点続いた場合、
+  TREND_ANOMALY として判定する。
+
+  今回の修正:
+  - 単一バッチ内のローカルカウントだけではデータ量不足でルールが機能しない問題を解消
+  - Machine_No × ROUTE_KEY ごとに dbo.Status_AnomalyDetect から直近
+    (ANOMALY_RULE2_WINDOW - 1) 件の履歴 anomaly_score を取得
+  - 履歴スコアと現バッチデータを Production_DateTime 昇順に結合し、
+    連続 >= UWL カウントを再計算する
+  - ANOMALY (単点UCL異常) は上書きしない
+  """
+  if pred_df.empty:
+    return pred_df
+
+  required_cols = [
+    "Machine_No",
+    "Product_No_TBM",
+    "ROUTE_KEY",
+    "Production_DateTime",
+    "anomaly_score",
+    "judgment",
+    "trigger_rule",
+  ]
+
+  missing = [c for c in required_cols if c not in pred_df.columns]
+  if missing:
+    log_message(f"[RULE2] skipped. missing columns={missing}")
+    return pred_df
+
+  df = pred_df.copy()
+
+  df["_rule2_datetime"] = pd.to_datetime(
+    df["Production_DateTime"],
+    errors="coerce",
+  )
+
+  df["_rule2_score"] = pd.to_numeric(
+    df["anomaly_score"],
+    errors="coerce",
+  )
+
+  # Machine_No × ROUTE_KEY でグループ化（機台×経路単位の連続性を判定）
+  group_cols = ["Machine_No", "ROUTE_KEY"]
+
+  df["_rule2_idx"] = df.index  # 元のインデックスを保持
+
+  total_trend = 0
+  groups_processed = 0
+
+  for (machine_no, route_key), grp in df.groupby(group_cols, dropna=False):
+    # NaN キーのグループはスキップ（DB検索不可）
+    if pd.isna(machine_no) or pd.isna(route_key):
+      continue
+
+    groups_processed += 1
+
+    # ---- 履歴スコアをDBから取得 ----
+    hist_limit = ANOMALY_RULE2_WINDOW - 1
+    hist_df = _fetch_historical_scores(machine_no, route_key, hist_limit)
+
+    # 履歴スコアをリスト化（既に昇順）
+    if hist_df.empty:
+      hist_scores = []
+    else:
+      hist_scores = (
+        pd.to_numeric(hist_df["anomaly_score"], errors="coerce")
+          .tolist()
+      )
+
+    # 現バッチの行を Production_DateTime 昇順に整列
+    grp_sorted = grp.sort_values("_rule2_datetime")
+    batch_scores = grp_sorted["_rule2_score"].tolist()
+
+    # 履歴 + 現バッチの連結スコア系列
+    combined_scores = hist_scores + batch_scores
+    hist_len = len(hist_scores)
+
+    # 連結系列に対して連続 >= UWL カウントを計算
+    consecutive = 0
+
+    for i, score in enumerate(combined_scores):
+      if pd.notna(score) and float(score) >= ANOMALY_UWL:
+        consecutive += 1
+      else:
+        consecutive = 0
+
+      # 現バッチの行についてのみ判定
+      if i >= hist_len:
+        batch_pos = i - hist_len
+        row_idx = grp_sorted.iloc[batch_pos]["_rule2_idx"]
+
+        if consecutive >= ANOMALY_RULE2_WINDOW:
+          current_judgment = str(df.at[row_idx, "judgment"])
+
+          # 単点UCL異常 (ANOMALY) は上書きしない
+          if current_judgment != "ANOMALY":
+            df.at[row_idx, "judgment"] = "TREND_ANOMALY"
+            df.at[row_idx, "trigger_rule"] = (
+              f"RULE2_CONSECUTIVE_UWL_{ANOMALY_RULE2_WINDOW}"
+            )
+            total_trend += 1
+
+  # ---- ログ出力 ----
+  if total_trend > 0:
+    log_message(
+      f"[RULE2] consecutive UWL detected (cross-batch). "
+      f"TREND_ANOMALY={total_trend} "
+      f"groups_processed={groups_processed} "
+      f"window={ANOMALY_RULE2_WINDOW} UWL={ANOMALY_UWL} "
+      f"hist_lookback={ANOMALY_RULE2_WINDOW - 1}"
+    )
+  else:
+    log_message(
+      f"[RULE2] no consecutive UWL (cross-batch). "
+      f"groups_processed={groups_processed} "
+      f"window={ANOMALY_RULE2_WINDOW} UWL={ANOMALY_UWL} "
+      f"hist_lookback={ANOMALY_RULE2_WINDOW - 1}"
+    )
+
+  # 内部作業列を削除
+  df = df.drop(
+    columns=[
+      "_rule2_datetime",
+      "_rule2_score",
+      "_rule2_idx",
+    ],
+    errors="ignore",
+  )
+
+  return df
+def call_datarobot_api(model_key: tuple, df_part: pd.DataFrame) -> pd.DataFrame:
+
+    """
+
+    DataRobot リアルタイム予測APIで予測。
+
+    model_key = (Machine_No, ROUTE_KEY)
+
+    """
+
+    t0 = time.perf_counter()
+
+ 
+
+    deployment_info = DEPLOYMENT_CONFIG[model_key]
+
+    deployment_id = deployment_info["deployment_id"]
+
+    deployment_key = deployment_info["deployment_key"]
+
+ 
+
+    log_message(
+
+        f"[PREDICT] start {deployment_key} "
+
+        f"Machine_No={model_key[0]} "
+
+        f"ROUTE_KEY={model_key[1]} "
+
+        f"rows={len(df_part)}"
+
+    )
+
+ 
+
+    dr.Client(
+
+        endpoint=getattr(config, 'ENDPOINT', "https://app.datarobot.com/api/v2"),
+
+        token=DATAROBOT_API_TOKEN,
+
+        trace_context="AnomalyDetectRealtime",
+
+    )
+
+ 
+
+    send_cols = [c for c in df_part.columns if not is_prediction_excluded_column(c)]
+
+ 
+
+    excluded_cols = [c for c in df_part.columns if is_prediction_excluded_column(c)]
+
+ 
+
+    df_send = df_part[send_cols].copy()
+
+ 
+
+    nullified_cols = []
+
+ 
+
+    if NULL_DISABLED_FEATURES_FOR_PREDICTION:
+
+        for col in df_send.columns:
+
+            if is_disabled_feature(col):
+
+                df_send[col] = None
+
+                nullified_cols.append(col)
+
+ 
+
+    log_message(f"[PREDICT] excluded_cols={excluded_cols}")
+
+    log_message(f"[PREDICT] nullified_cols={nullified_cols}")
+
+ 
+
+    for col in df_send.columns:
+
+        if pd.api.types.is_datetime64_any_dtype(df_send[col]):
+
+            df_send[col] = df_send[col].astype(str)
+
+ 
+
+    deployment = dr.Deployment.get(deployment_id)
+
+ 
+
+    pred_df, _ = predict(
+
+        deployment=deployment,
+
+        data_frame=df_send,
+
+        max_explanations=MAX_EXPLANATIONS,
+
+    )
+
+ 
+
+    key_cols = [
+
+        "Machine_No",
+
+        "Product_No_TBM",
+
+        "Production_DateTime",
+
+        "Serial_No_TBM",
+
+        "ROUTE_KEY",
+
+    ]
+
+ 
+
+    pred_df = pd.concat(
+
+        [
+
+            df_part[key_cols].reset_index(drop=True),
+
+            pred_df.reset_index(drop=True),
+
+        ],
+
+        axis=1,
+
+    )
+
+ 
+
+    pred_df["deployment_key"] = deployment_key
+
+    pred_df["deployment_id"] = deployment_id
+
+ 
+
+    pred_df = add_judgment_columns(pred_df)
+
+ 
+
+    log_message(
+
+        f"[JUDGE] {deployment_key} "
+
+        f"rows={len(pred_df)} "
+
+        f"NORMAL={(pred_df['judgment'] == 'NORMAL').sum()} "
+
+        f"WARNING={(pred_df['judgment'] == 'WARNING').sum()} "
+
+        f"ANOMALY={(pred_df['judgment'] == 'ANOMALY').sum()} "
+
+        f"SENSOR_FAULT_SUPPRESSED={(pred_df['judgment'] == 'SENSOR_FAULT_SUPPRESSED').sum()} "
+
+        f"ERROR={(pred_df['judgment'] == 'ERROR').sum()}"
+
+    )
+
+ 
+
+    log_elapsed(
+
+        f"[PREDICT] finish {deployment_key} "
+
+        f"Machine_No={model_key[0]} "
+
+        f"ROUTE_KEY={model_key[1]} "
+
+        f"rows={len(df_part)}",
+
+        t0,
+
+    )
+
+ 
+
+    return pred_df
+
+ 
+
+ 
+
+# ==========================================
+
+# 6. Status Writeback
+
+# ==========================================
+
+ 
+
+ 
+
+def classify_prediction_exception(error: Exception) -> tuple[str, str]:
+
+    """
+
+    予測処理中の例外を運用上の再処理判断に使える粒度へ分類する。
+
+ 
+
+    ERROR_DATA:
+
+        予測結果・入力データ構造起因。原則再処理しない。
+
+    ERROR_API:
+
+        DataRobot API / 通信 / Proxy / HTTP / timeout 起因。再処理候補。
+
+    ERROR_SYSTEM:
+
+        スクリプト、設定、SQL、想定外例外。修正後の再処理候補。
+
+    """
+
+    error_text = f"{type(error).__name__}: {error}".lower()
+
+ 
+
+    data_keywords = [
+
+        "anomaly score列が見つかりません".lower(),
+
+        "score_column_not_found",
+
+        "score_null",
+
+        "invalid_score",
+
+        "必須列不足".lower(),
+
+        "missing required",
+
+        "missing column",
+
+    ]
+
+ 
+
+    api_keywords = [
+
+        "timeout",
+
+        "timed out",
+
+        "connection",
+
+        "connectionerror",
+
+        "proxy",
+
+        "407",
+
+        "429",
+
+        "500",
+
+        "502",
+
+        "503",
+
+        "504",
+
+        "http",
+
+        "httperror",
+
+        "ssl",
+
+        "tls",
+
+        "network",
+
+        "datarobot",
+
+        "deployment",
+
+        "prediction server",
+
+        "service unavailable",
+
+        "too many requests",
+
+    ]
+
+ 
+
+    if any(keyword in error_text for keyword in data_keywords):
+
+        return "ERROR_DATA", "PREDICT_DATA_ERROR"
+
+ 
+
+    if any(keyword in error_text for keyword in api_keywords):
+
+        return "ERROR_API", "PREDICT_API_ERROR"
+
+ 
+
+    return "ERROR_SYSTEM", "PREDICT_SYSTEM_ERROR"
+
+ 
+
+ 
+
+def write_success_status(pred_df: pd.DataFrame, model_key: tuple) -> None:
+
+    deployment_info = DEPLOYMENT_CONFIG[model_key]
+
+    deployment_key = deployment_info["deployment_key"]
+
+ 
+
+    rows = []
+
+ 
+
+    for _, row in pred_df.iterrows():
+
+        score = row.get("anomaly_score")
+
+        judgment = row.get("judgment", "SUCCESS")
+
+        trigger_rule = row.get("trigger_rule")
+
+        suppressed_feature = row.get("suppressed_feature")
+
+        top_explanation_raw = row.get("top_explanation_raw")
+
+ 
+
+        rows.append(
+
+            {
+
+                "Machine_No": row.get("Machine_No"),
+
+                "Product_No_TBM": row.get("Product_No_TBM"),
+
+                "Production_DateTime": row.get("Production_DateTime"),
+
+                "Serial_No_TBM": row.get("Serial_No_TBM"),
+
+                "status": judgment,
+
+                "message": (
+
+                    f"deployment={deployment_key}, "
+
+                    f"Machine_No={row.get('Machine_No')}, "
+
+                    f"route={row.get('ROUTE_KEY')}, "
+
+                    f"score={score}, "
+
+                    f"trigger={trigger_rule}, "
+
+                    f"top_raw={top_explanation_raw}, "
+
+                    f"suppressed_feature={suppressed_feature}"
+
+                ),
+
+                "anomaly_score": score,
+
+                "judgment": judgment,
+
+                "trigger_rule": trigger_rule,
+
+                "deployment_key": deployment_key,
+
+                "route_key": row.get("ROUTE_KEY"),
+
+                "top_explanation": row.get("top_explanation"),
+
+            }
+
+        )
+
+ 
+
+    insert_status_rows(rows)
+
+ 
+
+ 
+
+def write_error_status(
+
+    df_part: pd.DataFrame,
+
+    model_key: tuple,
+
+    error_message: str,
+
+    error_status: str = "ERROR_SYSTEM",
+
+    trigger_rule: str = "PREDICT_SYSTEM_ERROR",
+
+) -> None:
+
+    deployment_info = DEPLOYMENT_CONFIG.get(model_key, {})
+
+    deployment_key = deployment_info.get("deployment_key", str(model_key))
+
+ 
+
+    rows = []
+
+ 
+
+    for _, row in df_part.iterrows():
+
+        rows.append(
+
+            {
+
+                "Machine_No": row.get("Machine_No"),
+
+                "Product_No_TBM": row.get("Product_No_TBM"),
+
+                "Production_DateTime": row.get("Production_DateTime"),
+
+                "Serial_No_TBM": row.get("Serial_No_TBM"),
+
+                "status": error_status,
+
+                "message": (
+
+                    f"deployment={deployment_key}, "
+
+                    f"Machine_No={row.get('Machine_No')}, "
+
+                    f"route={row.get('ROUTE_KEY')}, "
+
+                    f"error_status={error_status}, "
+
+                    f"trigger={trigger_rule}, "
+
+                    f"error={error_message}"
+
+                ),
+
+                "anomaly_score": None,
+
+                "judgment": error_status,
+
+                "trigger_rule": trigger_rule,
+
+                "deployment_key": deployment_key,
+
+                "route_key": row.get("ROUTE_KEY"),
+
+                "top_explanation": None,
+
+            }
+
+        )
+
+ 
+
+    insert_status_rows(rows)
+
+ 
+
+ 
+
+# ==========================================
+
+# 7. Output
+
+# ==========================================
+
+ 
+
+ 
+
+def save_predictions(
+
+    all_preds: List[pd.DataFrame],
+
+    path: str | None = None,
+
+) -> None:
+
+    if not all_preds:
+
+        log_message("[SAVE] no predictions to save")
+
+        return
+
+ 
+
+    t0 = time.perf_counter()
+
+ 
+
+    out_df = pd.concat(all_preds, ignore_index=True)
+
+ 
+
+    if path is None:
+
+        os.makedirs(config.ANOMALY_SAVE_DIR, exist_ok=True)
+
+        path = os.path.join(
+
+            config.ANOMALY_SAVE_DIR,
+
+            f"anomaly_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+
+        )
+
+ 
+
+    out_df.to_csv(path, index=False, encoding="utf-8-sig")
+
+ 
+
+    log_elapsed(f"[SAVE] finish prediction csv path={path} rows={len(out_df)}", t0)
+
+ 
+
+ 
+
+
+# ==========================================
+# 7.5 Explanation Trend Graph
+# ==========================================
+
+
+
+def generate_explanation_trend_graph(
+  machine_no,
+  route_key,
+  event_time,       # datetime / str — イベント発生時刻
+  top_feature,      # str | None — Top Explanation 特徴量名
+  trigger_rule="",  # str — トリガールール名（タイトル表示用）
+):
+  """
+  異常スコア推移グラフ（双Y軸）を生成する。
+
+  左軸: anomaly_score 推移 [0.0, 1.0]（UCL / UWL 警戒線付き）
+  右軸: Top Explanation 該当センサー値の推移（取得可能な場合のみ）
+
+  時間範囲: event_time ± EXPLANATION_TREND_WINDOW_MINUTES_{BEFORE,AFTER}
+
+  本関数は非主軸の可視化処理であるため、あらゆる例外を内部で捕捉し、
+  メインスクリプトのフローを一切ブロックしない。
+  """
+  import matplotlib
+  matplotlib.use("Agg")
+  import matplotlib.pyplot as plt
+  import matplotlib.dates as mdates
+  from datetime import timedelta
+
+  try:
+    # ---- 0. 前処理: イベント時刻の正規化 ----
+    if isinstance(event_time, str):
+      event_dt = pd.to_datetime(event_time, errors="coerce")
+    else:
+      event_dt = pd.to_datetime(event_time)
+
+    if pd.isna(event_dt):
+      log_message(
+        f"[TREND_GRAPH] invalid event_time={event_time} "
+        f"Machine_No={machine_no} ROUTE_KEY={route_key}"
+      )
+      return
+
+    window_start = event_dt - timedelta(minutes=EXPLANATION_TREND_WINDOW_MINUTES_BEFORE)
+    window_end   = event_dt + timedelta(minutes=EXPLANATION_TREND_WINDOW_MINUTES_AFTER)
+
+    # ---- 1. 左軸用: Status_AnomalyDetect から anomaly_score 履歴を取得 ----
+    score_sql = f"""
+    SELECT Production_DateTime, anomaly_score
+    FROM {STATUS_TABLE}
+    WHERE Machine_No = ? AND route_key = ?
+      AND Production_DateTime >= ? AND Production_DateTime <= ?
+      AND anomaly_score IS NOT NULL
+    ORDER BY Production_DateTime ASC
+    """
+
+    with get_connection() as conn:
+      score_df = pd.read_sql(
+        score_sql, conn,
+        params=[machine_no, route_key, window_start, window_end],
+      )
+
+    if score_df.empty:
+      log_message(
+        f"[TREND_GRAPH] no anomaly_score data in window "
+        f"Machine_No={machine_no} ROUTE_KEY={route_key}"
+      )
+      return
+
+    score_df["_dt"] = pd.to_datetime(score_df["Production_DateTime"], errors="coerce")
+    score_df["_score"] = pd.to_numeric(score_df["anomaly_score"], errors="coerce")
+    score_df = score_df.dropna(subset=["_dt", "_score"])
+
+    if score_df.empty:
+      return
+
+    # ---- 2. 右軸用: ANOMALY_HISTORICAL_FEATURE_VIEW (全量履歴View1) から該当特徴量の実測値を試行取得 ----
+    feature_df = pd.DataFrame()
+    feature_col_name = None
+    if top_feature and str(top_feature).strip():
+      feature_col_name = str(top_feature).strip()
+      # 列名の表記ゆれを吸収 (例: Band_drum_Circ_Act-Std ↔ Band_drum_Circ_Act_Std)
+      col_candidate_hyphen = feature_col_name
+      col_candidate_underscore = feature_col_name.replace("-", "_")
+
+      try:
+        feature_sql = f"""
+        SELECT Production_DateTime, [{col_candidate_hyphen}] AS _fv
+        FROM {ANOMALY_HISTORICAL_FEATURE_VIEW}
+        WHERE Machine_No = ? AND ROUTE_KEY = ?
+          AND Production_DateTime >= ? AND Production_DateTime <= ?
+        ORDER BY Production_DateTime ASC
+        """
+        with get_connection() as conn:
+          feature_df = pd.read_sql(
+            feature_sql, conn,
+            params=[machine_no, route_key, window_start, window_end],
+          )
+      except Exception:
+        # ハイフン表記で失敗した場合、アンダースコア表記でリトライ
+        try:
+          feature_sql2 = f"""
+          SELECT Production_DateTime, [{col_candidate_underscore}] AS _fv
+          FROM {ANOMALY_HISTORICAL_FEATURE_VIEW}
+          WHERE Machine_No = ? AND ROUTE_KEY = ?
+            AND Production_DateTime >= ? AND Production_DateTime <= ?
+          ORDER BY Production_DateTime ASC
+          """
+          with get_connection() as conn:
+            feature_df = pd.read_sql(
+              feature_sql2, conn,
+              params=[machine_no, route_key, window_start, window_end],
+            )
+        except Exception:
+          feature_df = pd.DataFrame()
+
+    has_feature_data = False
+    if not feature_df.empty and "_fv" in feature_df.columns:
+      feature_df["_dt"] = pd.to_datetime(feature_df["Production_DateTime"], errors="coerce")
+      feature_df["_fv"] = pd.to_numeric(feature_df["_fv"], errors="coerce")
+      feature_df = feature_df.dropna(subset=["_dt", "_fv"])
+      has_feature_data = not feature_df.empty
+
+    # ---- 3. 出力ディレクトリ確保 ----
+    output_dir = os.path.join(config.ANOMALY_SAVE_DIR, EXPLANATION_TREND_OUTPUT_SUBDIR)
+    os.makedirs(output_dir, exist_ok=True)
+
+    ts_str = event_dt.strftime("%Y%m%d_%H%M%S")
+    safe_machine = str(machine_no).replace("/", "_").replace("\\", "_")
+    safe_route = str(route_key).replace("/", "_").replace("\\", "_")
+    output_path = os.path.join(
+      output_dir,
+      f"Trend_{safe_machine}_{safe_route}_{ts_str}.png",
+    )
+
+    # ---- 4. 作図 ----
+    fig, ax_left = plt.subplots(figsize=(14, 6))
+
+    # 左軸: anomaly_score 折れ線
+    ax_left.plot(
+      score_df["_dt"], score_df["_score"],
+      color="#1f77b4", linewidth=1.2, marker=".", markersize=3,
+      label="anomaly_score", zorder=3,
+    )
+    ax_left.set_ylabel("Anomaly Score", color="#1f77b4", fontsize=10)
+    ax_left.set_ylim(0.0, 1.0)
+    ax_left.tick_params(axis="y", labelcolor="#1f77b4")
+
+    # UCL / UWL 水平警戒線
+    ax_left.axhline(
+      y=ANOMALY_UCL, color="red", linestyle="--", linewidth=1.0,
+      label=f"UCL={ANOMALY_UCL}", zorder=2,
+    )
+    ax_left.axhline(
+      y=ANOMALY_UWL, color="orange", linestyle="--", linewidth=1.0,
+      label=f"UWL={ANOMALY_UWL}", zorder=2,
+    )
+
+    # イベント発生時刻に垂直線
+    ax_left.axvline(
+      x=event_dt, color="magenta", linestyle=":", linewidth=1.0,
+      label="Event Time", zorder=2,
+    )
+
+    # 右軸: Top Explanation 実測値（取得できた場合のみ）
+    if has_feature_data:
+      ax_right = ax_left.twinx()
+      ax_right.plot(
+        feature_df["_dt"], feature_df["_fv"],
+        color="#d62728", linewidth=1.0, linestyle="-", marker="s",
+        markersize=3, label=f"{feature_col_name} (raw)", zorder=3,
+      )
+      ax_right.set_ylabel(
+        f"{feature_col_name} (raw)",
+        color="#d62728", fontsize=9,
+      )
+      ax_right.tick_params(axis="y", labelcolor="#d62728")
+
+    # X軸フォーマット
+    ax_left.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+    ax_left.xaxis.set_major_locator(mdates.AutoDateLocator())
+    fig.autofmt_xdate(rotation=30, ha="right")
+
+    # タイトル・凡例
+    title_line1 = f"Machine_No={machine_no}  ROUTE_KEY={route_key}"
+    title_line2 = f"Event: {ts_str}  Rule: {trigger_rule}  TopFeature: {feature_col_name or \"N/A\"}"
+    ax_left.set_title(
+      f"{title_line1}\n{title_line2}",
+      fontsize=10, fontweight="bold",
+    )
+
+    # 凡例を左右合成
+    lines_left, labels_left = ax_left.get_legend_handles_labels()
+    if has_feature_data:
+      lines_right, labels_right = ax_right.get_legend_handles_labels()
+      ax_left.legend(
+        lines_left + lines_right,
+        labels_left + labels_right,
+        loc="upper left", fontsize=8, ncol=2,
+      )
+    else:
+      ax_left.legend(loc="upper left", fontsize=8, ncol=2)
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    log_message(
+      f"[TREND_GRAPH] saved {output_path} "
+      f"score_points={len(score_df)} "
+        f"feature_points={len(feature_df) if has_feature_data else 0} "
+        f"feature_col={feature_col_name or \"N/A\"}"
+    )
+
+  except Exception as e:
+    # グラフ描画の例外はすべて捕捉し、メインスクリプトには伝播させない
+    log_message(
+      f"[TREND_GRAPH] non-blocking failure "
+      f"Machine_No={machine_no} ROUTE_KEY={route_key} "
+      f"error={e}"
+    )
+    log_message(traceback.format_exc())
+    try:
+      plt.close("all")
+    except Exception:
+      pass
+
+
+
+def generate_explanation_trend_graphs(all_preds: list) -> None:
+  """
+  全予測結果の中から異常イベントを抽出し、Explanation Trend Graph を生成する。
+
+  - EXPLANATION_TREND_TARGET_STATUSES に該当する judgment のみ対象
+  - anomaly_score 降順で上位 EXPLANATION_TREND_MAX_EVENTS 件を処理
+  - 本関数内で発生する例外はすべて捕捉し、メインフローは停止しない
+  """
+  t0 = time.perf_counter()
+
+  try:
+    merged_df = pd.concat(all_preds, ignore_index=True)
+
+    if "judgment" not in merged_df.columns:
+      log_message("[TREND_GRAPH] no judgment column. skip.")
+      return
+
+    # 対象ステータスに絞り込み
+    target_statuses = list(EXPLANATION_TREND_TARGET_STATUSES)
+    event_mask = merged_df["judgment"].isin(target_statuses)
+    event_df = merged_df[event_mask].copy()
+
+    if event_df.empty:
+      log_message(
+        f"[TREND_GRAPH] no events with target statuses {target_statuses}. skip."
+      )
+      return
+
+    # anomaly_score 降順に整列し、上位 N 件を抽出
+    if "anomaly_score" in event_df.columns:
+      event_df["_sort_score"] = pd.to_numeric(
+        event_df["anomaly_score"], errors="coerce"
+      )
+      event_df = event_df.sort_values("_sort_score", ascending=False)
+    else:
+      event_df["_sort_score"] = 0.0
+
+    event_df = event_df.head(EXPLANATION_TREND_MAX_EVENTS)
+
+    log_message(
+      f"[TREND_GRAPH] target events={len(event_df)} "
+      f"max={EXPLANATION_TREND_MAX_EVENTS} "
+      f"statuses={target_statuses}"
+    )
+
+    generated = 0
+    for _, row in event_df.iterrows():
+      machine_no = row.get("Machine_No")
+      route_key = row.get("ROUTE_KEY")
+      event_time = row.get("Production_DateTime")
+      top_feature = row.get("top_explanation")
+      trigger_rule = row.get("trigger_rule", "")
+
+      if machine_no is None or route_key is None or event_time is None:
+        continue
+
+      generate_explanation_trend_graph(
+        machine_no=machine_no,
+        route_key=route_key,
+        event_time=event_time,
+        top_feature=top_feature,
+        trigger_rule=str(trigger_rule),
+      )
+      generated += 1
+
+    log_elapsed(
+      f"[TREND_GRAPH] finished. generated={generated} / candidates={len(event_df)}",
+      t0,
+    )
+
+  except Exception as e:
+    log_message(f"[TREND_GRAPH] batch generation failed (non-blocking): {e}")
+    log_message(traceback.format_exc())
+    try:
+      import matplotlib.pyplot as _plt
+      _plt.close("all")
+    except Exception:
+      pass
+
+
+
+
+def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
+  """
+  全予測結果をExcelレポートとして出力する。
+
+  - Silent Mode: 全件 NORMAL の場合はスキップ（旧007方針準拠）。
+  - 異常（WARNING / ANOMALY / TREND_ANOMALY / SENSOR_FAULT_SUPPRESSED）が
+    1件でも存在すればExcelを生成する。
+  - ファイル名: Anomaly_Report_{YYYYMMDD_HHMMSS}.xlsx
+  - 正常時は絶対パスを返し、スキップ/失敗時は None を返す。
+  """
+  if not all_preds:
+    log_message("[EXCEL] no predictions. skip excel report.")
+    return None
+
+  try:
+    merged_df = pd.concat(all_preds, ignore_index=True)
+
+    if "judgment" not in merged_df.columns:
+      log_message("[EXCEL] no judgment column found. skip excel report.")
+      return None
+
+    # ---- Silent Mode: 全件NORMALならスキップ ----
+    non_normal_mask = merged_df["judgment"] != "NORMAL"
+    if not non_normal_mask.any():
+      log_message(
+        f"[EXCEL] all {len(merged_df)} records are NORMAL. "
+        f"skip excel report (Silent Mode)."
+      )
+      return None
+
+    # ---- 核心列のみ抽出 ----
+    core_columns = [
+      "Machine_No",
+      "Product_No_TBM",
+      "Production_DateTime",
+      "Serial_No_TBM",
+      "ROUTE_KEY",
+      "anomaly_score",
+      "judgment",
+      "trigger_rule",
+      "top_explanation",
+    ]
+
+    existing_cols = [c for c in core_columns if c in merged_df.columns]
+    report_df = merged_df[existing_cols].copy()
+
+    # ---- 出力パス ----
+    os.makedirs(config.ANOMALY_SAVE_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(
+      config.ANOMALY_SAVE_DIR,
+      f"Anomaly_Report_{ts}.xlsx",
+    )
+
+    # ---- openpyxl で書き出し ----
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+      report_df.to_excel(writer, index=False, sheet_name="Anomaly_Report")
+
+    log_message(
+      f"[EXCEL] report saved path={output_path} rows={len(report_df)} "
+      f"non_normal={non_normal_mask.sum()}"
+    )
+    return output_path
+
+  except Exception as e:
+    log_message(f"[EXCEL] report generation failed (non-blocking): {e}")
+    log_message(traceback.format_exc())
+    return None
+# ==========================================
+
+# 8. Main
+
+# ==========================================
+
+ 
+
+ 
+
+def run_anomaly_detect() -> int:
+
+    total_t0 = time.perf_counter()
+
+ 
+
+  log_message("============================================================")
+
+    log_message("[TOTAL] start AnomalyDetect_new.py")
+
+ 
+
+    raw_df = fetch_pending_data()
+
+ 
+
+    if raw_df.empty:
+
+        log_elapsed("[TOTAL] pending data = 0", total_t0)
+
+        log_message("============================================================")
+
+        return 0
+
+ 
+
+    routed = split_by_routing(raw_df)
+
+ 
+
+    if not routed:
+
+        log_elapsed("[TOTAL] valid routed data = 0", total_t0)
+
+        log_message("============================================================")
+
+        return 0
+
+ 
+
+    all_preds: List[pd.DataFrame] = []
+
+    total_success = 0
+
+ 
+
+    max_workers = getattr(config_anomaly, "MAX_WORKERS", 1)
+
+ 
+
+    log_message(f"[CONFIG] MAX_WORKERS={max_workers} BATCH_SIZE={BATCH_SIZE}")
+
+    log_message(
+
+        f"[CONFIG] SENSOR_FAULT_SUPPRESSION={ENABLE_SENSOR_FAULT_SUPPRESSION} "
+
+        f"EXCLUDE_DISABLED_FEATURES_FROM_PREDICTION={EXCLUDE_DISABLED_FEATURES_FROM_PREDICTION} "
+
+        f"NULL_DISABLED_FEATURES_FOR_PREDICTION={NULL_DISABLED_FEATURES_FOR_PREDICTION} "
+
+        f"DISABLED_FEATURES={sorted(DISABLED_ANOMALY_FEATURES)}"
+
+    )
+
+ 
+
+    def run_one_batch(model_key: tuple, batch_df: pd.DataFrame):
+
+        pred_df = call_datarobot_api(model_key, batch_df)
+
+        return model_key, batch_df, pred_df
+
+ 
+
+    futures = {}
+
+ 
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+        for model_key, df_part in routed.items():
+
+            deployment_key = DEPLOYMENT_CONFIG[model_key]["deployment_key"]
+
+ 
+
+            log_message(
+
+                f"[QUEUE] {deployment_key} "
+
+                f"Machine_No={model_key[0]} "
+
+                f"ROUTE_KEY={model_key[1]} "
+
+                f"rows={len(df_part)}"
+
+            )
+
+ 
+
+            for start in range(0, len(df_part), BATCH_SIZE):
+
+                batch_df = df_part.iloc[start : start + BATCH_SIZE].copy()
+
+                future = executor.submit(run_one_batch, model_key, batch_df)
+
+                futures[future] = (model_key, batch_df)
+
+ 
+
+        for future in as_completed(futures):
+
+            model_key, batch_df = futures[future]
+
+            deployment_key = DEPLOYMENT_CONFIG[model_key]["deployment_key"]
+
+ 
+
+            try:
+
+                result_t0 = time.perf_counter()
+
+ 
+
+                model_key, batch_df, pred_df = future.result()
+
+ 
+
+                # ==========================================
+
+                # Rule2: Consecutive UWL judgment
+
+                # ==========================================
+
+                # DataRobot予測後、Status書込み前に連続5点判定を付与する。
+
+                # ここで付与しないと、Status_AnomalyDetect に TREND_ANOMALY が残らない。
+
+                pred_df = apply_rule2_consecutive_uwl(pred_df)
+
+ 
+
+                all_preds.append(pred_df)
+
+ 
+
+                status_t0 = time.perf_counter()
+
+                write_success_status(pred_df, model_key)
+
+                log_elapsed(
+
+                    f"[STATUS] success write {deployment_key} rows={len(batch_df)}",
+
+                    status_t0,
+
+                )
+
+ 
+
+                total_success += len(batch_df)
+
+ 
+
+                log_elapsed(
+
+                    f"[RESULT] success {deployment_key} "
+
+                    f"Machine_No={model_key[0]} "
+
+                    f"ROUTE_KEY={model_key[1]} "
+
+                    f"rows={len(batch_df)}",
+
+                    result_t0,
+
+                )
+
+ 
+
+            except Exception as e:
+
+                err = str(e)
+
+                error_status, trigger_rule = classify_prediction_exception(e)
+
+ 
+
+                status_t0 = time.perf_counter()
+
+                write_error_status(
+
+                    batch_df,
+
+                    model_key,
+
+                    err,
+
+                    error_status=error_status,
+
+                    trigger_rule=trigger_rule,
+
+                )
+
+                log_elapsed(
+
+                    f"[STATUS] error write {deployment_key} "
+
+                    f"status={error_status} trigger={trigger_rule} rows={len(batch_df)}",
+
+                    status_t0,
+
+                )
+
+ 
+
+                log_message(
+
+                    f"[ERROR] {deployment_key} "
+
+                    f"Machine_No={model_key[0]} "
+
+                    f"ROUTE_KEY={model_key[1]} "
+
+                    f"rows={len(batch_df)} "
+
+                    f"status={error_status} "
+
+                    f"trigger={trigger_rule} "
+
+                    f"error={err}"
+
+                )
+
+ 
+
+                log_message(traceback.format_exc())
+
+ 
+
+    # ==========================================
+
+    # Silent Rule / CSV Output Control
+
+    # ==========================================
+
+    # 旧007方針:
+
+    # - 全件NORMALならCSVを出さない
+
+    # - WARNING / ANOMALY / TREND_ANOMALY が1件でもあればCSVを保存する
+
+ 
+
+    if not all_preds:
+
+        log_message("[SILENT] no predictions. skip prediction csv.")
+
+    else:
+
+        merged_pred_df = pd.concat(all_preds, ignore_index=True)
+
+ 
+
+        if "judgment" not in merged_pred_df.columns:
+
+            log_message(
+
+                "[SAVE] judgment column not found. save prediction csv for safety."
+
+            )
+
+            save_predictions(all_preds)
+
+        else:
+
+            warning_count = int((merged_pred_df["judgment"] == "WARNING").sum())
+
+            anomaly_count = int((merged_pred_df["judgment"] == "ANOMALY").sum())
+
+            trend_anomaly_count = int(
+
+                (merged_pred_df["judgment"] == "TREND_ANOMALY").sum()
+
+            )
+
+            normal_count = int((merged_pred_df["judgment"] == "NORMAL").sum())
+
+            total_count = len(merged_pred_df)
+
+ 
+
+            if warning_count == 0 and anomaly_count == 0 and trend_anomaly_count == 0:
+
+                log_message(
+
+                    f"[SILENT] All NORMAL. skip prediction csv. "
+
+                    f"total={total_count} NORMAL={normal_count} "
+
+                    f"WARNING={warning_count} ANOMALY={anomaly_count} "
+
+                    f"TREND_ANOMALY={trend_anomaly_count}"
+
+                )
+
+            else:
+
+                log_message(
+
+                    f"[ALERT] abnormal prediction exists. save prediction csv. "
+
+                    f"total={total_count} NORMAL={normal_count} "
+
+                    f"WARNING={warning_count} ANOMALY={anomaly_count} "
+
+                    f"TREND_ANOMALY={trend_anomaly_count}"
+
+                )
+
+                save_predictions(all_preds)
+
+  # ==========================================
+  # Explanation Trend Graph Generation
+  # ==========================================
+
+  if ENABLE_EXPLANATION_TREND_GRAPH and all_preds:
+    trend_graph_t0 = time.perf_counter()
+    try:
+      generate_explanation_trend_graphs(all_preds)
+    except Exception:
+      # グラフ生成の例外はすべて捕捉済み。
+      # ここでの二重捕捉は run_anomaly_detect 全体の安全弁。
+      log_message("[TREND_GRAPH] unexpected error in trend graph batch. (non-blocking)")
+      log_message(traceback.format_exc())
+    log_elapsed("[TREND_GRAPH] all explanation trend graphs finished", trend_graph_t0)
+  else:
+    log_message("[TREND_GRAPH] disabled or no predictions. skip.")
+
+  # ==========================================
+  # Excel Report Generation
+  # ==========================================
+
+  if ENABLE_EXCEL_REPORT and all_preds:
+    excel_t0 = time.perf_counter()
+    try:
+      report_path = generate_excel_report(all_preds)
+      if report_path:
+        log_message(f"[EXCEL] report generated successfully: {report_path}")
+    except Exception as e:
+      log_message(f"[EXCEL] report generation failed (non-blocking): {e}")
+      log_message(traceback.format_exc())
+    log_elapsed("[EXCEL] excel report process finished", excel_t0)
+  else:
+    log_message("[EXCEL] disabled or no predictions. skip.")
+
+     
+
+  log_elapsed(f"[TOTAL] finish total_success={total_success}", total_t0)
+
+  log_message("============================================================")
+
+ 
+
+  return total_success
+
+ 
+
+ 
+
+if __name__ == "__main__":
+
+    run_anomaly_detect()
+
