@@ -2258,322 +2258,358 @@ def _compute_trend_graph_path(machine_no, route_key, event_time, trend_dir: str)
 
 
 
+
+
+
+
+
+
+
+
 def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
   """
-  TireMonitor Anomaly Detection Dashboard (007) — v3.1 修正版。
-  Block 1 (Row 1-6): ダッシュボードヘッダ（A-B のみ）
-  Block 2 (Row 10+): 異常タイヤ明細（A-L 12列 / Top_Explanation_Value + AI_Diagnosis_Comment）
-  Block 3 (明細+3行後): 純粋散布図集（Chart 1 100%独立 + 特徴量ごと）
+  TireMonitor Dashboard (007) v3.5 — merge_asof跨维度变色 + judgment降级 + 特征时间軸循環内完全解耦
   """
   if not all_preds:
     log_message("[EXCEL] no predictions. skip excel report.")
     return None
-
   try:
-    merged_df = pd.concat(all_preds, ignore_index=True)
+    merged_df=pd.concat(all_preds,ignore_index=True)
     if "judgment" not in merged_df.columns:
       log_message("[EXCEL] no judgment column found. skip excel report.")
       return None
-    non_normal_mask = merged_df["judgment"] != "NORMAL"
+    non_normal_mask=merged_df["judgment"]!="NORMAL"
     if not non_normal_mask.any():
       log_message(f"[EXCEL] all {len(merged_df)} records are NORMAL. skip excel report (Silent Mode).")
       return None
-    abnormal_df = merged_df[non_normal_mask].copy()
+    abnormal_df=merged_df[non_normal_mask].copy()
     if "anomaly_score" in abnormal_df.columns:
-      abnormal_df["_sort_score"] = pd.to_numeric(abnormal_df["anomaly_score"], errors="coerce")
-      abnormal_df = abnormal_df.sort_values("_sort_score", ascending=False)
-    abnormal_df = abnormal_df.reset_index(drop=True)
-
-    os.makedirs(config.ANOMALY_SAVE_DIR, exist_ok=True)
-    ts_dt = datetime.now()
-    ts = ts_dt.strftime("%Y%m%d_%H%M%S")
-    ts_display = ts_dt.strftime("%Y-%m-%d %H:%M:%S")
-    output_path = os.path.join(config.ANOMALY_SAVE_DIR, f"Anomaly_Report_{ts}.xlsx")
+      abnormal_df["_sort_score"]=pd.to_numeric(abnormal_df["anomaly_score"],errors="coerce")
+      abnormal_df=abnormal_df.sort_values("_sort_score",ascending=False)
+    abnormal_df=abnormal_df.reset_index(drop=True)
+    window_hours=getattr(config_anomaly,"ANOMALY_TREND_WINDOW_HOURS",4)
+    os.makedirs(config.ANOMALY_SAVE_DIR,exist_ok=True)
+    ts_dt=datetime.now();ts=ts_dt.strftime("%Y%m%d_%H%M%S")
+    ts_display=ts_dt.strftime("%Y-%m-%d %H:%M:%S")
+    output_path=os.path.join(config.ANOMALY_SAVE_DIR,f"Anomaly_Report_{ts}.xlsx")
 
     from openpyxl import Workbook
     from openpyxl.drawing.image import Image
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
     from openpyxl.utils import get_column_letter
+    wb=Workbook();ws=wb.active;ws.title="Dashboard_007"
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Dashboard_007"
+    DARK_BLUE="#1F4E78";LIGHT_GRAY="#F2F2F2";WHITE="#FFFFFF"
+    header_fill=PatternFill(start_color=DARK_BLUE,end_color=DARK_BLUE,fill_type="solid")
+    header_font=Font(bold=True,size=11,color=WHITE,name="Calibri")
+    title_font=Font(bold=True,size=16,color=WHITE,name="Calibri")
+    label_font=Font(bold=True,size=10,color=DARK_BLUE,name="Calibri")
+    value_font=Font(size=10,color="#333333",name="Calibri")
+    data_font=Font(size=10,color="#333333",name="Calibri")
+    header_align=Alignment(horizontal="center",vertical="center",wrap_text=True)
+    label_align=Alignment(horizontal="left",vertical="center")
+    value_align=Alignment(horizontal="left",vertical="center",wrap_text=True)
+    data_align=Alignment(vertical="center",wrap_text=True)
+    thin_border=Border(left=Side(style="thin",color=DARK_BLUE),right=Side(style="thin",color=DARK_BLUE),top=Side(style="thin",color=DARK_BLUE),bottom=Side(style="thin",color=DARK_BLUE))
+    trend_dir=os.path.join(config.ANOMALY_SAVE_DIR,EXPLANATION_TREND_OUTPUT_SUBDIR)
+    os.makedirs(trend_dir,exist_ok=True)
 
-    DARK_BLUE = "#1F4E78"
-    LIGHT_GRAY = "#F2F2F2"
-    WHITE = "#FFFFFF"
-    header_fill = PatternFill(start_color=DARK_BLUE, end_color=DARK_BLUE, fill_type="solid")
-    header_font = Font(bold=True, size=11, color=WHITE, name="Calibri")
-    title_font = Font(bold=True, size=16, color=WHITE, name="Calibri")
-    label_font = Font(bold=True, size=10, color=DARK_BLUE, name="Calibri")
-    value_font = Font(size=10, color="#333333", name="Calibri")
-    data_font = Font(size=10, color="#333333", name="Calibri")
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    label_align = Alignment(horizontal="left", vertical="center")
-    value_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    data_align = Alignment(vertical="center", wrap_text=True)
-    thin_border = Border(
-      left=Side(style="thin", color=DARK_BLUE),
-      right=Side(style="thin", color=DARK_BLUE),
-      top=Side(style="thin", color=DARK_BLUE),
-      bottom=Side(style="thin", color=DARK_BLUE),
-    )
-
-    trend_dir = os.path.join(config.ANOMALY_SAVE_DIR, EXPLANATION_TREND_OUTPUT_SUBDIR)
-    os.makedirs(trend_dir, exist_ok=True)
+    # ---- トップレベル: スコア→色ルーター ----
+    def _score_to_color(sc):
+      if pd.isna(sc):return DARK_BLUE
+      if float(sc)>=ANOMALY_UCL:return "#FF0000"
+      if float(sc)>=ANOMALY_UWL:return "#FF9900"
+      return DARK_BLUE
 
     # ================================================================
     # BLOCK 1 (Row 1-6)
     # ================================================================
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["A"].width=22;ws.column_dimensions["B"].width=32
     ws.merge_cells("A1:L1")
-    c = ws.cell(row=1, column=1, value="TireMonitor Anomaly Detection Dashboard (007)")
-    c.font = title_font; c.fill = header_fill
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 36
-    dash_rows = [
-      (2, "Target System", "AnomalyDetect_new (007)"),
-      (3, "Batch Timestamp", ts_display),
-      (4, "Total Inspected", len(merged_df)),
-      (5, "Abnormal Detected", non_normal_mask.sum()),
-    ]
-    for rnum, label, val in dash_rows:
-      ws.row_dimensions[rnum].height = 20
-      ca = ws.cell(row=rnum, column=1, value=label)
-      ca.font = label_font; ca.alignment = label_align
-      ca.fill = PatternFill(start_color=LIGHT_GRAY, end_color=LIGHT_GRAY, fill_type="solid")
-      ca.border = thin_border
-      cb = ws.cell(row=rnum, column=2, value=val)
-      cb.font = value_font; cb.alignment = value_align; cb.border = thin_border
+    c=ws.cell(row=1,column=1,value="TireMonitor Anomaly Detection Dashboard (007)")
+    c.font=title_font;c.fill=header_fill;c.alignment=Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height=36
+    for rnum,label,val in [(2,"Target System","AnomalyDetect_new (007)"),(3,"Batch Timestamp",ts_display),(4,"Total Inspected",len(merged_df)),(5,"Abnormal Detected",non_normal_mask.sum())]:
+      ws.row_dimensions[rnum].height=20
+      ca=ws.cell(row=rnum,column=1,value=label);ca.font=label_font;ca.alignment=label_align
+      ca.fill=PatternFill(start_color=LIGHT_GRAY,end_color=LIGHT_GRAY,fill_type="solid");ca.border=thin_border
+      cb=ws.cell(row=rnum,column=2,value=val);cb.font=value_font;cb.alignment=value_align;cb.border=thin_border
     if "trigger_rule" in abnormal_df.columns:
-      rule_counts = abnormal_df["trigger_rule"].value_counts()
-      rule_summary = ", ".join([f"{r}({c})" for r, c in rule_counts.items()])
-    else:
-      rule_summary = "N/A"
-    ws.row_dimensions[6].height = 20
-    ca6 = ws.cell(row=6, column=1, value="Alarm Trigger Rule")
-    ca6.font = label_font; ca6.alignment = label_align
-    ca6.fill = PatternFill(start_color=LIGHT_GRAY, end_color=LIGHT_GRAY, fill_type="solid")
-    ca6.border = thin_border
-    cb6 = ws.cell(row=6, column=2, value=rule_summary)
-    cb6.font = value_font; cb6.alignment = value_align; cb6.border = thin_border
-    ws.row_dimensions[7].height = 6
+      rc=abnormal_df["trigger_rule"].value_counts();rule_summary=", ".join([f"{r}({c})" for r,c in rc.items()])
+    else:rule_summary="N/A"
+    ws.row_dimensions[6].height=20
+    ca6=ws.cell(row=6,column=1,value="Alarm Trigger Rule");ca6.font=label_font;ca6.alignment=label_align
+    ca6.fill=PatternFill(start_color=LIGHT_GRAY,end_color=LIGHT_GRAY,fill_type="solid");ca6.border=thin_border
+    cb6=ws.cell(row=6,column=2,value=rule_summary);cb6.font=value_font;cb6.alignment=value_align;cb6.border=thin_border
+    ws.row_dimensions[7].height=6
 
     # ================================================================
     # BLOCK 2 (Row 10+) — A-L 12列
     # ================================================================
-    detail_start = 10
-    # 列定義 (1-indexed): 1=Rank 2=Machine_No 3=ProdDT 4=ProdNo 5=Serial 6=Route 7=Score 8=Judgment 9=Trigger 10=TopFeat 11=TopFeatVal 12=AI_Comment
-    detail_headers = ["Rank","Machine_No","Production_DateTime","Product_No_TBM","Serial_No_TBM","ROUTE_KEY","anomaly_score","judgment","trigger_rule","top_explanation","Top_Explanation_Value","AI_Diagnosis_Comment"]
-    NUM_COLS = len(detail_headers)
-    AI_COL = NUM_COLS  # 12 = L
-    ws.row_dimensions[detail_start].height = 22
-    for ci, hdr in enumerate(detail_headers, 1):
-      c = ws.cell(row=detail_start, column=ci, value=hdr)
-      c.font = header_font; c.fill = header_fill; c.alignment = header_align; c.border = thin_border
-    col_widths = [6,14,22,18,18,18,16,14,22,30,22,40]
-    for ci, w in enumerate(col_widths, 1):
-      ws.column_dimensions[get_column_letter(ci)].width = w
+    detail_start=10
+    detail_headers=["Rank","Machine_No","Production_DateTime","Product_No_TBM","Serial_No_TBM","ROUTE_KEY","anomaly_score","judgment","trigger_rule","top_explanation","Top_Explanation_Value","AI_Diagnosis_Comment"]
+    NUM_COLS=len(detail_headers);AI_COL=NUM_COLS
+    ws.row_dimensions[detail_start].height=22
+    for ci,hdr in enumerate(detail_headers,1):
+      c=ws.cell(row=detail_start,column=ci,value=hdr);c.font=header_font;c.fill=header_fill;c.alignment=header_align;c.border=thin_border
+    for ci,w in enumerate([6,14,22,18,18,18,16,14,22,30,22,40],1):
+      ws.column_dimensions[get_column_letter(ci)].width=w
 
-    # ---- 内部: 特徴量物理値取得 (case-insensitive) ----
-    def _fetch_feature_value(mno, rkey, pdt, feat_name):
+    def _fetch_feature_value(mno,rkey,pdt,feat_name):
       try:
-        if feat_name is None or pd.isna(pdt): return None
-        fname_lower = str(feat_name).strip().lower()
-        if not fname_lower: return None
-        # 小文字 + ハイフン/アンダースコア両方試行
-        candidates = list(dict.fromkeys([fname_lower, fname_lower.replace("-","_"), str(feat_name).strip(), str(feat_name).strip().replace("-","_")]))
-        for col_try in candidates:
+        if feat_name is None or pd.isna(pdt):return None
+        fn=str(feat_name).strip().lower()
+        if not fn:return None
+        cands=list(dict.fromkeys([fn,fn.replace("-","_"),str(feat_name).strip(),str(feat_name).strip().replace("-","_")]))
+        for ct in cands:
           try:
-            sql = f"SELECT TOP 1 [{col_try}] AS _fv FROM {ANOMALY_HISTORICAL_FEATURE_VIEW} WHERE Machine_No = ? AND ROUTE_KEY = ? AND Production_DateTime = ?"
             with get_connection() as conn:
-              df = pd.read_sql(sql, conn, params=[mno, rkey, pdt])
+              df=pd.read_sql(f"SELECT TOP 1 [{ct}] AS _fv FROM {ANOMALY_HISTORICAL_FEATURE_VIEW} WHERE Machine_No=? AND ROUTE_KEY=? AND Production_DateTime=?",conn,params=[mno,rkey,pdt])
             if not df.empty and "_fv" in df.columns:
-              val = df.at[0, "_fv"]
-              if pd.notna(val):
-                try: return round(float(val), 4)
-                except: return str(val)[:30]
-          except Exception: continue
+              v=df.at[0,"_fv"]
+              if pd.notna(v):
+                try:return round(float(v),4)
+                except:return str(v)[:30]
+          except:continue
         return None
-      except Exception: return None
+      except:return None
 
-    # データ行
-    data_row = detail_start + 1
-    for idx, (_, row) in enumerate(abnormal_df.iterrows()):
-      rank = idx + 1
-      ws.row_dimensions[data_row].height = 20
-      judgment = str(row.get("judgment", ""))
-      mno = row.get("Machine_No")
-      rkey = row.get("ROUTE_KEY")
-      pdt = row.get("Production_DateTime")
-      tfeat = row.get("top_explanation")
-      trig = str(row.get("trigger_rule", ""))
-      pdt_str = pdt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(pdt, pd.Timestamp) else str(pdt)
-      score_val = round(float(row.get("anomaly_score", 0)), 4) if pd.notna(row.get("anomaly_score")) else None
+    # ---- AI 事前一括取得 (Key=Serial_No_TBM / 全異常行強制触発) ----
+    ai_cache={};ai_barcodes=set()
+    if ENABLE_AI_DIAGNOSIS:
+      for _,row in abnormal_df.iterrows():
+        judgment=str(row.get("judgment",""))
+        if judgment!="NORMAL":
+          try:
+            barcode="".join(str(row.get("Serial_No_TBM")).split())
+            if not barcode or barcode in ai_barcodes:continue
+            ai_barcodes.add(barcode)
+            comment=call_datarobot_genai_diagnosis(
+              machine_no=row.get("Machine_No"),
+              route_key=row.get("ROUTE_KEY"),
+              trigger_rule=str(row.get("trigger_rule","")),
+              top_explanation=str(row.get("top_explanation","") if pd.notna(row.get("top_explanation")) else "N/A"),
+            )
+            if comment:ai_cache[barcode]=str(comment)[:500]
+          except Exception as diag_err:
+            log_message(f"[GENAI] pre-fetch failed barcode={row.get(\"Serial_No_TBM\")}: {diag_err}")
+            log_message(traceback.format_exc())
 
-      vals = [rank, mno, pdt_str, row.get("Product_No_TBM"), row.get("Serial_No_TBM"), rkey, score_val, judgment, trig, str(tfeat) if pd.notna(tfeat) else None, None, None]
-      for ci, v in enumerate(vals, 1):
-        if v is not None or ci in (11, 12):
-          c = ws.cell(row=data_row, column=ci, value=v if ci < 11 else None)
-          c.font = data_font; c.alignment = data_align; c.border = thin_border
-
-      # Col 11: Top_Explanation_Value (case-insensitive)
+    data_row=detail_start+1
+    for _,row in abnormal_df.iterrows():
+      rank=list(abnormal_df.index).index(row.name)+1
+      ws.row_dimensions[data_row].height=20
+      judgment=str(row.get("judgment",""));mno=row.get("Machine_No");rkey=row.get("ROUTE_KEY")
+      pdt=row.get("Production_DateTime");tfeat=row.get("top_explanation");trig=str(row.get("trigger_rule",""))
+      pdt_str=pdt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(pdt,pd.Timestamp) else str(pdt)
+      score_val=round(float(row.get("anomaly_score",0)),4) if pd.notna(row.get("anomaly_score")) else None
+      vals=[rank,mno,pdt_str,row.get("Product_No_TBM"),row.get("Serial_No_TBM"),rkey,score_val,judgment,trig,str(tfeat) if pd.notna(tfeat) else None,None,None]
+      for ci,v in enumerate(vals,1):
+        if v is not None or ci>=11:
+          c=ws.cell(row=data_row,column=ci,value=v if ci<11 else None);c.font=data_font;c.alignment=data_align;c.border=thin_border
       try:
-        fv = _fetch_feature_value(mno, rkey, pdt, tfeat)
+        fv=_fetch_feature_value(mno,rkey,pdt,tfeat)
         if fv is not None:
-          c11 = ws.cell(row=data_row, column=11, value=fv)
-          c11.font = data_font; c11.alignment = data_align; c11.border = thin_border
-      except Exception: pass
-
-      # Col 12: AI_Diagnosis_Comment (任意の異常行で強制実行)
-      if judgment != "NORMAL" and ENABLE_AI_DIAGNOSIS:
-        try:
-          comment = call_datarobot_genai_diagnosis(
-            machine_no=mno, route_key=rkey,
-            trigger_rule=trig,
-            top_explanation=str(tfeat) if pd.notna(tfeat) else "N/A",
-          )
-          if comment:
-            c12 = ws.cell(row=data_row, column=AI_COL, value=str(comment)[:500])
-            c12.font = Font(size=9, color="#333333", name="Calibri")
-            c12.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-            c12.border = thin_border
-        except Exception as diag_err:
-          log_message(f"[GENAI] row {data_row}: {diag_err}")
-          log_message(traceback.format_exc())
-
-      # 行色
-      if judgment == "ANOMALY":
-        rf = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-      elif judgment == "TREND_ANOMALY":
-        rf = PatternFill(start_color="FFEBAF", end_color="FFEBAF", fill_type="solid")
-      elif judgment == "WARNING":
-        rf = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
-      else: rf = None
+          c11=ws.cell(row=data_row,column=11,value=fv);c11.font=data_font;c11.alignment=data_align;c11.border=thin_border
+      except:pass
+      current_barcode="".join(str(row.get("Serial_No_TBM")).split())
+      cached_comment=ai_cache.get(current_barcode)
+      if cached_comment:
+        c12=ws.cell(row=data_row,column=AI_COL,value=cached_comment)
+        c12.font=Font(size=9,color="#333333",name="Calibri")
+        c12.alignment=Alignment(horizontal="left",vertical="top",wrap_text=True);c12.border=thin_border
+      if judgment=="ANOMALY":rf=PatternFill(start_color="FFC7CE",end_color="FFC7CE",fill_type="solid")
+      elif judgment=="TREND_ANOMALY":rf=PatternFill(start_color="FFEBAF",end_color="FFEBAF",fill_type="solid")
+      elif judgment=="WARNING":rf=PatternFill(start_color="FFFFCC",end_color="FFFFCC",fill_type="solid")
+      else:rf=None
       if rf:
-        for ci in range(1, NUM_COLS + 1):
-          ws.cell(row=data_row, column=ci).fill = rf
-      data_row += 1
-    last_detail_row = data_row - 1
+        for ci in range(1,NUM_COLS+1):ws.cell(row=data_row,column=ci).fill=rf
+      data_row+=1
+    last_detail_row=data_row-1
 
     # ================================================================
-    # BLOCK 3: 純粋散布図集
+    # BLOCK 3: merge_asof跨维度变色 + 循環内完全独立時間軸
     # ================================================================
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    from datetime import timedelta
+    import matplotlib;matplotlib.use("Agg");import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates;from datetime import timedelta
+    chart_row=last_detail_row+4
 
-    chart_row = last_detail_row + 4
-    top_ev = abnormal_df.iloc[0]
-    ref_dt_raw = top_ev.get("Production_DateTime")
-    ref_dt = pd.to_datetime(ref_dt_raw) if not isinstance(ref_dt_raw, pd.Timestamp) else ref_dt_raw
-    w4s = ref_dt - timedelta(hours=4); w4e = ref_dt + timedelta(hours=4)
-    ref_mno = top_ev.get("Machine_No"); ref_rkey = top_ev.get("ROUTE_KEY")
+    # Chart 1 用グローバル時間軸
+    if "Production_DateTime" in abnormal_df.columns:
+      all_pdt=pd.to_datetime(abnormal_df["Production_DateTime"],errors="coerce").dropna()
+      if len(all_pdt)>0:global_tmin=all_pdt.min();global_tmax=all_pdt.max()
+      else:global_tmin=ts_dt;global_tmax=ts_dt
+    else:global_tmin=ts_dt;global_tmax=ts_dt
+    win_start=global_tmin-timedelta(hours=window_hours)
+    win_end=global_tmax+timedelta(hours=window_hours)
+    ref_mno=abnormal_df.iloc[0].get("Machine_No")
+    ref_rkey=abnormal_df.iloc[0].get("ROUTE_KEY")
 
-    def _make_scatter_png(x_vals, y_vals, title_str, ylabel_str, ylim=None, hlines=None, color="#1F4E78"):
+    def _make_scatter_png(x_vals,y_vals,title_str,ylabel_str,ylim=None,hlines=None,colors=None):
       try:
-        fig, ax = plt.subplots(figsize=(8, 3))
-        ax.scatter(x_vals, y_vals, c=color, marker=".", s=12, alpha=0.85, zorder=3)
-        ax.set_title(title_str, fontsize=9, fontweight="bold", color=DARK_BLUE)
-        ax.set_ylabel(ylabel_str, fontsize=8, color=DARK_BLUE)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-        ax.tick_params(labelsize=7)
-        if ylim: ax.set_ylim(*ylim)
+        if colors is None:colors=[DARK_BLUE]*len(x_vals)
+        fig,ax=plt.subplots(figsize=(8,3))
+        ax.scatter(x_vals,y_vals,c=colors,marker=".",s=12,alpha=0.85,zorder=3)
+        ax.set_title(title_str,fontsize=9,fontweight="bold",color=DARK_BLUE)
+        ax.set_ylabel(ylabel_str,fontsize=8,color=DARK_BLUE)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"));ax.tick_params(labelsize=7)
+        if ylim:ax.set_ylim(*ylim)
         if hlines:
-          for yv, ls, lc, ll in hlines:
-            ax.axhline(y=yv, linestyle=ls, color=lc, linewidth=0.8, label=ll)
-          ax.legend(fontsize=7, loc="upper right")
-        fig.autofmt_xdate(rotation=20, ha="right")
-        plt.tight_layout()
-        p = os.path.join(trend_dir, f"_scatter_{abs(hash(title_str))}.png")
-        fig.savefig(p, dpi=150, bbox_inches="tight")
-        plt.close(fig); return p
+          for yv,ls,lc,ll in hlines:ax.axhline(y=yv,linestyle=ls,color=lc,linewidth=0.8,label=ll)
+          ax.legend(fontsize=7,loc="upper right")
+        fig.autofmt_xdate(rotation=20,ha="right");plt.tight_layout()
+        p=os.path.join(trend_dir,f"_scatter_{abs(hash(title_str))}.png")
+        fig.savefig(p,dpi=150,bbox_inches="tight");plt.close(fig);return p
       except Exception:
-        try: plt.close("all")
-        except: pass
+        try:plt.close("all")
+        except:pass
         return None
 
-    # ---- Chart 1: Anomaly Score Scatter (100% 独立生成) ----
-    chart1_ok = False
+    # ---- Chart 1: Anomaly Score Scatter ----
+    chart1_ok=False
     try:
       with get_connection() as conn:
-        sdf = pd.read_sql(f"SELECT Production_DateTime, anomaly_score FROM {STATUS_TABLE} WHERE Machine_No = ? AND route_key = ? AND Production_DateTime >= ? AND Production_DateTime <= ? AND anomaly_score IS NOT NULL ORDER BY Production_DateTime ASC", conn, params=[ref_mno, ref_rkey, w4s, w4e])
+        sdf=pd.read_sql(f"SELECT Production_DateTime,anomaly_score FROM {STATUS_TABLE} WHERE Machine_No=? AND route_key=? AND Production_DateTime>=? AND Production_DateTime<=? AND anomaly_score IS NOT NULL ORDER BY Production_DateTime ASC",conn,params=[ref_mno,ref_rkey,win_start,win_end])
       if not sdf.empty:
-        sdf["_dt"] = pd.to_datetime(sdf["Production_DateTime"]); sdf["_s"] = pd.to_numeric(sdf["anomaly_score"], errors="coerce")
-        sdf = sdf.dropna(subset=["_dt","_s"])
+        sdf["_dt"]=pd.to_datetime(sdf["Production_DateTime"]);sdf["_s"]=pd.to_numeric(sdf["anomaly_score"],errors="coerce")
+        sdf=sdf.dropna(subset=["_dt","_s"])
       if not sdf.empty:
-        hl = [(ANOMALY_UCL,"--","red",f"UCL={ANOMALY_UCL}"),(ANOMALY_UWL,"--","orange",f"UWL={ANOMALY_UWL}")]
-        png1 = _make_scatter_png(sdf["_dt"], sdf["_s"], f"Chart 1: Anomaly Score Scatter | M={ref_mno} R={ref_rkey} | +/-4h", "Anomaly Score", ylim=(0.0,1.0), hlines=hl)
+        hl=[(ANOMALY_UCL,"--","red",f"UCL={ANOMALY_UCL}"),(ANOMALY_UWL,"--","orange",f"UWL={ANOMALY_UWL}")]
+        png1=_make_scatter_png(sdf["_dt"],sdf["_s"],f"Chart 1: Score Scatter | M={ref_mno} R={ref_rkey} | +/-{window_hours}h","Anomaly Score",ylim=(0.0,1.0),hlines=hl,colors=[_score_to_color(sc) for sc in sdf["_s"]])
         if png1 and os.path.exists(png1):
           ws.merge_cells(f"A{chart_row}:L{chart_row}")
-          ws.cell(row=chart_row, column=1, value="Chart 1: Anomaly Score Scatter (+/-4h)").font = Font(bold=True, size=10, color=DARK_BLUE)
-          chart_row += 1
-          for rr in range(chart_row, chart_row+6): ws.row_dimensions[rr].height = 48
+          ws.cell(row=chart_row,column=1,value=f"Chart 1: Anomaly Score Scatter (+/-{window_hours}h) Red=ANOMALY Orange=WARNING Blue=NORMAL").font=Font(bold=True,size=10,color=DARK_BLUE)
+          chart_row+=1
+          for rr in range(chart_row,chart_row+6):ws.row_dimensions[rr].height=48
           ws.merge_cells(f"A{chart_row}:L{chart_row+5}")
-          img1 = Image(png1); img1.width = 960; img1.height = 360
-          ws.add_image(img1, f"A{chart_row}")
-          chart_row += 6; chart1_ok = True
+          img1=Image(png1);img1.width=960;img1.height=360;ws.add_image(img1,f"A{chart_row}")
+          chart_row+=6;chart1_ok=True
     except Exception as e1:
       log_message(f"[EXCEL] Chart-1 failed (non-blocking): {e1}")
     if not chart1_ok:
       ws.merge_cells(f"A{chart_row}:L{chart_row}")
-      ws.cell(row=chart_row, column=1, value="Chart 1: Score data unavailable for this time window.").font = Font(size=10, color="#999999", italic=True)
-      chart_row += 1
+      ws.cell(row=chart_row,column=1,value="Chart 1: Score data unavailable for this time window.").font=Font(size=10,color="#999999",italic=True)
+      chart_row+=1
 
-    # ---- 動的チャート: Top Explanation ごとの物理値散布図 ----
-    unique_features = abnormal_df["top_explanation"].dropna().unique() if "top_explanation" in abnormal_df.columns else []
-    chart_idx = 1
+    # ---- 動的チャート — 各特徴量 循環内完全独立 Query + merge_asof + judgment降級変色 ----
+    unique_features=abnormal_df["top_explanation"].dropna().unique() if "top_explanation" in abnormal_df.columns else []
+    chart_idx=1
     for feat_name in unique_features:
-      fname = str(feat_name).strip()
-      if not fname: continue
-      chart_idx += 1; fname_lower = fname.lower()
-      col_candidates = list(dict.fromkeys([fname, fname.replace("-","_"), fname_lower, fname_lower.replace("-","_")]))
+      fname=str(feat_name).strip()
+      if not fname:continue
+      chart_idx+=1;fname_lower=fname.lower()
+      feat_rows=abnormal_df[abnormal_df["top_explanation"].apply(lambda x:str(x).strip().lower()==fname_lower if pd.notna(x) else False)]
+      if len(feat_rows)==0:
+        feat_rows=abnormal_df[abnormal_df["top_explanation"].apply(lambda x:str(x).strip().lower()==fname_lower.replace("-","_") if pd.notna(x) else False)]
       try:
-        fdf = pd.DataFrame()
-        for col_try in col_candidates:
+        # FIX 2: 循環内で完全独立した時間窓
+        if len(feat_rows)>0:
+          current_feat_pdt=pd.to_datetime(feat_rows.iloc[0].get("Production_DateTime"),errors="coerce")
+          feat_mno=feat_rows.iloc[0].get("Machine_No");feat_rkey=feat_rows.iloc[0].get("ROUTE_KEY")
+        else:
+          # FIX 2: 該当行なし → 留空スキップ (ref_mno/rkey 絶対禁止)
+          ws.merge_cells(f"A{chart_row}:L{chart_row}")
+          ws.cell(row=chart_row,column=1,value=f"Chart {chart_idx}: {fname} — Chart Data Unavailable").font=Font(size=10,color="#999999",italic=True)
+          chart_row+=1;continue
+        feat_win_start=current_feat_pdt-timedelta(hours=window_hours)
+        feat_win_end=current_feat_pdt+timedelta(hours=window_hours)
+
+        # Step A: View1 から特徴量生データ取得
+        col_candidates=list(dict.fromkeys([fname,fname.replace("-","_"),fname_lower,fname_lower.replace("-","_")]))
+        fdf=pd.DataFrame()
+        for ct in col_candidates:
           try:
             with get_connection() as conn:
-              fdf = pd.read_sql(f"SELECT Production_DateTime, [{col_try}] AS _fv FROM {ANOMALY_HISTORICAL_FEATURE_VIEW} WHERE Machine_No = ? AND ROUTE_KEY = ? AND Production_DateTime >= ? AND Production_DateTime <= ? ORDER BY Production_DateTime ASC", conn, params=[ref_mno, ref_rkey, w4s, w4e])
-            if not fdf.empty and "_fv" in fdf.columns: break
-          except Exception: continue
-        if fdf.empty or "_fv" not in fdf.columns: continue
-        fdf["_dt"] = pd.to_datetime(fdf["Production_DateTime"]); fdf["_fv"] = pd.to_numeric(fdf["_fv"], errors="coerce")
-        fdf = fdf.dropna(subset=["_dt","_fv"])
-        if len(fdf) == 0: continue
-        png_f = _make_scatter_png(fdf["_dt"], fdf["_fv"], f"Chart {chart_idx}: {fname} Raw Value | M={ref_mno} R={ref_rkey} | +/-4h", f"{fname} (raw)", color="#D44500")
+              fdf=pd.read_sql(f"SELECT Production_DateTime,[{ct}] AS _fv FROM {ANOMALY_HISTORICAL_FEATURE_VIEW} WHERE Machine_No=? AND ROUTE_KEY=? AND Production_DateTime>=? AND Production_DateTime<=? ORDER BY Production_DateTime ASC",conn,params=[feat_mno,feat_rkey,feat_win_start,feat_win_end])
+            if not fdf.empty and "_fv" in fdf.columns:break
+          except:continue
+        if fdf.empty or "_fv" not in fdf.columns:
+          ws.merge_cells(f"A{chart_row}:L{chart_row}")
+          ws.cell(row=chart_row,column=1,value=f"Chart {chart_idx}: {fname} — Chart Data Unavailable").font=Font(size=10,color="#999999",italic=True)
+          chart_row+=1;continue
+        fdf["_dt"]=pd.to_datetime(fdf["Production_DateTime"]);fdf["_fv"]=pd.to_numeric(fdf["_fv"],errors="coerce")
+        fdf=fdf.dropna(subset=["_dt","_fv"])
+        if len(fdf)==0:
+          ws.merge_cells(f"A{chart_row}:L{chart_row}")
+          ws.cell(row=chart_row,column=1,value=f"Chart {chart_idx}: {fname} — Chart Data Unavailable").font=Font(size=10,color="#999999",italic=True)
+          chart_row+=1;continue
+
+                # Step B: 同一時間窓の anomaly_score を【独立】再取得 → 秒級辞書マップ
+        scoredf=pd.DataFrame()
+        try:
+          with get_connection() as conn:
+            scoredf=pd.read_sql(f"SELECT Production_DateTime,anomaly_score FROM {STATUS_TABLE} WHERE Machine_No=? AND route_key=? AND Production_DateTime>=? AND Production_DateTime<=? AND anomaly_score IS NOT NULL",conn,params=[feat_mno,feat_rkey,feat_win_start,feat_win_end])
+          if not scoredf.empty:
+            scoredf["_dt"]=pd.to_datetime(scoredf["Production_DateTime"])
+            scoredf["_sc"]=pd.to_numeric(scoredf["anomaly_score"],errors="coerce")
+            scoredf=scoredf.dropna(subset=["_dt","_sc"])
+        except:pass
+
+        # FIX 1: 秒級タイムスタンプ辞書マップ (±45s 模糊滑動探索 / merge_asof 廃止)
+        score_map={}
+        for _,sr in scoredf.iterrows():
+          sts=int(sr["_dt"].timestamp())
+          sc=float(sr["_sc"])
+          if sc>=ANOMALY_UCL:score_map[sts]="ANOMALY"
+          elif sc>=ANOMALY_UWL:score_map[sts]="WARNING"
+          else:score_map[sts]="NORMAL"
+
+        ref_judgment=str(feat_rows.iloc[0].get("judgment","")) if len(feat_rows)>0 else "NORMAL"
+
+                feat_colors=[]
+        for _,frow in fdf.iterrows():
+          f_ts=int(frow["_dt"].timestamp())
+          matched_status="NORMAL"
+          for s_ts,status in score_map.items():
+            if abs(s_ts-f_ts)<=45:
+              matched_status=status
+              break
+          if matched_status=="ANOMALY":feat_colors.append("#FF0000")
+          elif matched_status in ("TREND_ANOMALY","WARNING"):feat_colors.append("#FF9900")
+          else:
+            # FIX 1: judgment降級 (else: else: 切除)
+            ref_j=str(feat_rows.iloc[0].get("judgment","")) if len(feat_rows)>0 else "NORMAL"
+            if ref_j=="ANOMALY":feat_colors.append("#FF0000")
+            elif ref_j in ("TREND_ANOMALY","WARNING"):feat_colors.append("#FF9900")
+            else:feat_colors.append(DARK_BLUE)
+
+        png_f=_make_scatter_png(fdf["_dt"],fdf["_fv"],f"Chart {chart_idx}: {fname} Raw Value | M={feat_mno} R={feat_rkey} | +/-{window_hours}h",f"{fname} (raw)",colors=feat_colors)
         if png_f and os.path.exists(png_f):
           ws.merge_cells(f"A{chart_row}:L{chart_row}")
-          ws.cell(row=chart_row, column=1, value=f"Chart {chart_idx}: {fname} Raw Feature Scatter").font = Font(bold=True, size=10, color=DARK_BLUE)
-          chart_row += 1
-          for rr in range(chart_row, chart_row+6): ws.row_dimensions[rr].height = 48
+          ws.cell(row=chart_row,column=1,value=f"Chart {chart_idx}: {fname} Raw Feature Scatter (Red=ANOMALY Orange=WARNING Blue=NORMAL)").font=Font(bold=True,size=10,color=DARK_BLUE)
+          chart_row+=1
+          for rr in range(chart_row,chart_row+6):ws.row_dimensions[rr].height=48
           ws.merge_cells(f"A{chart_row}:L{chart_row+5}")
-          img_f = Image(png_f); img_f.width = 960; img_f.height = 360
-          ws.add_image(img_f, f"A{chart_row}")
-          chart_row += 6
+          img_f=Image(png_f);img_f.width=960;img_f.height=360;ws.add_image(img_f,f"A{chart_row}")
+          chart_row+=6
+        else:
+          ws.merge_cells(f"A{chart_row}:L{chart_row}")
+          ws.cell(row=chart_row,column=1,value=f"Chart {chart_idx}: {fname} — Chart Data Unavailable").font=Font(size=10,color="#999999",italic=True)
+          chart_row+=1
       except Exception as ef:
         log_message(f"[EXCEL] Chart-{chart_idx} failed for {fname}: {ef}")
+        try:plt.close("all")
+        except:pass
+        ws.merge_cells(f"A{chart_row}:L{chart_row}")
+        ws.cell(row=chart_row,column=1,value=f"Chart {chart_idx}: {fname} — Chart Data Unavailable").font=Font(size=10,color="#999999",italic=True)
+        chart_row+=1
 
     # ================================================================
-    # FIX 1: 列幅ハードコード強制上書き
+    # 列幅強制上書き
     # ================================================================
-    ws.column_dimensions["A"].width = 17
-    ws.column_dimensions["B"].width = 23
-
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+    ws.column_dimensions["A"].width=17
+    ws.column_dimensions["B"].width=23
+    ws.page_setup.orientation="landscape";ws.page_setup.fitToWidth=1;ws.page_setup.fitToHeight=0
     wb.save(output_path)
-
-    log_message(f"[EXCEL] dashboard v3.1 saved path={output_path} total={len(merged_df)} abnormal={len(abnormal_df)} scatter_charts={chart_idx}")
+    log_message(f"[EXCEL] dashboard v3.5 saved path={output_path} total={len(merged_df)} abnormal={len(abnormal_df)} scatter_charts={chart_idx} window_h={window_hours}")
     return output_path
 
   except Exception as e:
     log_message(f"[EXCEL] report generation failed (non-blocking): {e}")
     log_message(traceback.format_exc())
     try:
-      import matplotlib.pyplot as _plt; _plt.close("all")
-    except: pass
+      import matplotlib.pyplot as _plt;_plt.close("all")
+    except:pass
     return None
 
 
