@@ -2254,16 +2254,15 @@ def _compute_trend_graph_path(machine_no, route_key, event_time, trend_dir: str)
 
 
 
+
+
 def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
   """
-  TireMonitor Anomaly Detection Dashboard (007) — 3ブロック構成。
+  TireMonitor Anomaly Detection Dashboard (007) — v3 分散散布図版。
 
-  Block 1 (Row 1-7): ダッシュボードヘッダ（総覧 / アラーム要約 / NG時間帯）
-  Block 2 (Row 10+): 異常タイヤ明細（Rank / 機台 / 判定 / スコア / 特徴量）
-  Block 3 (明細後): 底部診断ボード（左: AI診断文 / 右: トレンドグラフ）
-
-  - Silent Mode: 全件 NORMAL ならスキップ。
-  - 全例外は非ブロッキングで捕捉し、メインフローには伝播させない。
+  Block 1 (Row 1-6): ダッシュボードヘッダ（A-B のみ / NG Time Pattern 廃止）
+  Block 2 (Row 10+): 異常タイヤ明細（A-K 11列 / Top_Explanation_Value 付き）
+  Block 3 (明細+3行後): 分散散布図集（Score散布図 + Top特徴量ごとの物理値散布図）
   """
   if not all_preds:
     log_message("[EXCEL] no predictions. skip excel report.")
@@ -2304,7 +2303,7 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
       f"Anomaly_Report_{ts}.xlsx",
     )
 
-    # ---- openpyxl インポート ----
+    # ---- openpyxl ----
     from openpyxl import Workbook
     from openpyxl.drawing.image import Image
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -2315,7 +2314,7 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
     ws.title = "Dashboard_007"
 
     # ================================================================
-    # 共通スタイル定義
+    # 共通スタイル
     # ================================================================
     DARK_BLUE = "#1F4E78"
     LIGHT_GRAY = "#F2F2F2"
@@ -2324,16 +2323,13 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
     header_fill = PatternFill(start_color=DARK_BLUE, end_color=DARK_BLUE, fill_type="solid")
     header_font = Font(bold=True, size=11, color=WHITE, name="Calibri")
     title_font = Font(bold=True, size=16, color=WHITE, name="Calibri")
-    section_font = Font(bold=True, size=12, color=DARK_BLUE, name="Calibri")
     label_font = Font(bold=True, size=10, color=DARK_BLUE, name="Calibri")
     value_font = Font(size=10, color="#333333", name="Calibri")
     data_font = Font(size=10, color="#333333", name="Calibri")
-    diag_font = Font(size=9, color="#333333", name="Calibri")
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     label_align = Alignment(horizontal="left", vertical="center")
     value_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
     data_align = Alignment(vertical="center", wrap_text=True)
-    diag_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
     thin_border = Border(
       left=Side(style="thin", color=DARK_BLUE),
       right=Side(style="thin", color=DARK_BLUE),
@@ -2341,14 +2337,18 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
       bottom=Side(style="thin", color=DARK_BLUE),
     )
 
-    # トレンドグラフ格納ディレクトリ
     trend_dir = os.path.join(config.ANOMALY_SAVE_DIR, EXPLANATION_TREND_OUTPUT_SUBDIR)
+    os.makedirs(trend_dir, exist_ok=True)
 
     # ================================================================
-    # BLOCK 1: ダッシュボードヘッダ (Row 1-7)
+    # BLOCK 1: ダッシュボードヘッダ (Row 1-6) — A-B のみ
     # ================================================================
 
-    # Row 1: 大タイトル (A1:K1 結合)
+    # 列幅: A=22, B=32
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 32
+
+    # Row 1: 大タイトル (A1:K1)
     ws.merge_cells("A1:K1")
     title_cell = ws.cell(row=1, column=1, value="TireMonitor Anomaly Detection Dashboard (007)")
     title_cell.font = title_font
@@ -2356,14 +2356,13 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 36
 
-    # Row 2-6: 左ラベル列 (A) / 値列 (B) / 右パネル (C-E 結合)
+    # Row 2-5: A(ラベル) / B(値)
     dash_rows = [
       (2, "Target System", "AnomalyDetect_new (007)"),
       (3, "Batch Timestamp", ts_display),
       (4, "Total Inspected", len(merged_df)),
       (5, "Abnormal Detected", non_normal_mask.sum()),
     ]
-
     for rnum, label, val in dash_rows:
       ws.row_dimensions[rnum].height = 20
       cell_a = ws.cell(row=rnum, column=1, value=label)
@@ -2376,14 +2375,13 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
       cell_b.alignment = value_align
       cell_b.border = thin_border
 
-    # Row 6: Alarm Trigger Rule (trigger_rule 集計)
+    # Row 6: Alarm Trigger Rule
     if "trigger_rule" in abnormal_df.columns:
       rule_counts = abnormal_df["trigger_rule"].value_counts()
       rule_parts = [f"{rule}({cnt})" for rule, cnt in rule_counts.items()]
       rule_summary = ", ".join(rule_parts)
     else:
       rule_summary = "N/A"
-
     ws.row_dimensions[6].height = 20
     cell_a6 = ws.cell(row=6, column=1, value="Alarm Trigger Rule")
     cell_a6.font = label_font
@@ -2395,71 +2393,20 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
     cell_b6.alignment = value_align
     cell_b6.border = thin_border
 
-    # 右パネル: C2:E6 結合 "NG Time Pattern"
-    ws.merge_cells("C2:E6")
-    ng_header = ws.cell(row=2, column=3, value="NG Time Pattern")
-    ng_header.font = Font(bold=True, size=10, color=WHITE, name="Calibri")
-    ng_header.fill = header_fill
-    ng_header.alignment = Alignment(horizontal="center", vertical="top")
-    ng_header.border = thin_border
-
-    # NG時間帯の簡易分析
-    if "Production_DateTime" in abnormal_df.columns and len(abnormal_df) > 0:
-      prod_times = pd.to_datetime(
-        abnormal_df["Production_DateTime"], errors="coerce"
-      )
-      valid_times = prod_times.dropna()
-      if len(valid_times) > 0:
-        from datetime import time
-        hours = valid_times.dt.hour
-        early_cnt = int(((hours >= 0) & (hours < 12)).sum())
-        late_cnt = int(((hours >= 12) & (hours < 24)).sum())
-        if late_cnt > early_cnt:
-          ng_pattern = f"Late Period / 後半集中\n\nEarly={early_cnt}  Late={late_cnt}"
-        elif early_cnt > late_cnt:
-          ng_pattern = f"Early Period / 前半集中\n\nEarly={early_cnt}  Late={late_cnt}"
-        else:
-          ng_pattern = f"Balanced / 均等分布\n\nEarly={early_cnt}  Late={late_cnt}"
-      else:
-        ng_pattern = "N/A"
-    else:
-      ng_pattern = "N/A"
-
-    ng_body = ws.cell(row=3, column=3, value=ng_pattern)
-    ng_body.font = Font(size=10, color="#333333", name="Calibri")
-    ng_body.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ng_body.border = thin_border
-    # C3:E6 を同じスタイルで埋める
-    for r in range(3, 7):
-      for c in range(3, 6):
-        cell = ws.cell(row=r, column=c)
-        cell.border = thin_border
-        if r > 3:
-          cell.font = Font(size=10, color="#333333", name="Calibri")
-
-    # F-K 列の Row 1-6 も境界線で整える
-    for r in range(1, 7):
-      for c in range(6, 12):
-        ws.cell(row=r, column=c).border = thin_border
-
-    # Row 7: 空行（セパレータ）
+    # Row 7: 空セパレータ
     ws.row_dimensions[7].height = 6
 
     # ================================================================
-    # BLOCK 2: 異常タイヤ明細表 (Row 10+)
+    # BLOCK 2: 異常タイヤ明細表 (Row 10+) — A-K 11列
     # ================================================================
 
     detail_start_row = 10
     detail_headers = [
-      "Rank", "Machine_No", "Product_No_TBM", "Serial_No_TBM",
-      "ROUTE_KEY", "anomaly_score", "judgment", "trigger_rule",
-      "top_explanation",
+      "Rank", "Machine_No", "Production_DateTime", "Product_No_TBM",
+      "Serial_No_TBM", "ROUTE_KEY", "anomaly_score", "judgment",
+      "trigger_rule", "top_explanation", "Top_Explanation_Value",
     ]
-    detail_cols = [
-      "_rank_", "Machine_No", "Product_No_TBM", "Serial_No_TBM",
-      "ROUTE_KEY", "anomaly_score", "judgment", "trigger_rule",
-      "top_explanation",
-    ]
+    NUM_DETAIL_COLS = len(detail_headers)  # 11
 
     # ヘッダ行
     ws.row_dimensions[detail_start_row].height = 22
@@ -2469,44 +2416,81 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
       cell.fill = header_fill
       cell.alignment = header_align
       cell.border = thin_border
-    # 列幅設定
-    col_widths = [6, 14, 18, 18, 18, 16, 14, 22, 30]
+
+    # 列幅 (A-K)
+    col_widths = [6, 14, 22, 18, 18, 18, 16, 14, 22, 30, 22]
     for ci, w in enumerate(col_widths, 1):
       ws.column_dimensions[get_column_letter(ci)].width = w
+
+    # ---- Top_Explanation_Value を DB から取得するヘルパー ----
+    def _fetch_feature_value(mno, rkey, pdt, feat_name):
+      """View1 から指定時刻の特徴量物理値を1点取得"""
+      try:
+        if feat_name is None or pd.isna(pdt):
+          return None
+        fname = str(feat_name).strip()
+        if not fname:
+          return None
+        # 列名ゆれ吸収: ハイフン → アンダースコア 両方試行
+        for col_try in [fname, fname.replace("-", "_")]:
+          try:
+            sql = f"SELECT TOP 1 [{col_try}] AS _fv FROM {ANOMALY_HISTORICAL_FEATURE_VIEW} WHERE Machine_No = ? AND ROUTE_KEY = ? AND Production_DateTime = ?"
+            with get_connection() as c:
+              df = pd.read_sql(sql, c, params=[mno, rkey, pdt])
+            if not df.empty and "_fv" in df.columns:
+              val = df.at[0, "_fv"]
+              if pd.notna(val):
+                try:
+                  return round(float(val), 4)
+                except Exception:
+                  return str(val)[:30]
+          except Exception:
+            continue
+        return None
+      except Exception:
+        return None
 
     # データ行
     data_row = detail_start_row + 1
     for idx, (_, row) in enumerate(abnormal_df.iterrows()):
       rank = idx + 1
       ws.row_dimensions[data_row].height = 20
+      judgment = str(row.get("judgment", ""))
+      machine_no = row.get("Machine_No")
+      route_key = row.get("ROUTE_KEY")
+      prod_dt = row.get("Production_DateTime")
+      top_feat = row.get("top_explanation")
 
-      # Rank
-      cell_rank = ws.cell(row=data_row, column=1, value=rank)
-      cell_rank.font = data_font
-      cell_rank.alignment = Alignment(horizontal="center", vertical="center")
-      cell_rank.border = thin_border
+      # 全11列を順に書込み
+      row_values = [
+        rank,
+        machine_no,
+        prod_dt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(prod_dt, pd.Timestamp) else str(prod_dt),
+        row.get("Product_No_TBM"),
+        row.get("Serial_No_TBM"),
+        route_key,
+        (round(float(row.get("anomaly_score", 0)), 4) if pd.notna(row.get("anomaly_score")) else None),
+        judgment,
+        str(row.get("trigger_rule", "")),
+        str(top_feat) if pd.notna(top_feat) else None,
+        None,  # Top_Explanation_Value → 後でDB取得
+      ]
 
-      # 残りの列
-      for ci, col_name in enumerate(detail_cols[1:], 2):
-        value = row.get(col_name) if col_name.startswith("_") else row.get(col_name)
-        if col_name == "_rank_":
-          value = rank
-        elif col_name == "anomaly_score":
-          try:
-            value = round(float(value), 4)
-          except Exception:
-            pass
-        if pd.isna(value):
-          value = None
-        elif isinstance(value, pd.Timestamp):
-          value = value.strftime("%Y-%m-%d %H:%M:%S")
-        cell = ws.cell(row=data_row, column=ci, value=value)
+      for ci, val in enumerate(row_values, 1):
+        cell = ws.cell(row=data_row, column=ci, value=val if not (isinstance(val, float) and pd.isna(val)) else None)
         cell.font = data_font
         cell.alignment = data_align
         cell.border = thin_border
 
-      # 判定に応じて行背景色を変更
-      judgment = str(row.get("judgment", ""))
+      # Top_Explanation_Value を非同期取得（失敗しても継続）
+      try:
+        fv = _fetch_feature_value(machine_no, route_key, prod_dt, top_feat)
+        if fv is not None:
+          ws.cell(row=data_row, column=NUM_DETAIL_COLS, value=fv)
+      except Exception:
+        pass
+
+      # 判定別行色
       if judgment == "ANOMALY":
         row_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
       elif judgment == "TREND_ANOMALY":
@@ -2516,7 +2500,7 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
       else:
         row_fill = None
       if row_fill:
-        for ci in range(1, len(detail_headers) + 1):
+        for ci in range(1, NUM_DETAIL_COLS + 1):
           ws.cell(row=data_row, column=ci).fill = row_fill
 
       data_row += 1
@@ -2524,144 +2508,180 @@ def generate_excel_report(all_preds: List[pd.DataFrame]) -> str | None:
     last_detail_row = data_row - 1
 
     # ================================================================
-    # BLOCK 3: 底部診断ボード (明細表 + 2行 空行)
+    # BLOCK 3: 分散散布図集 (明細表 + 3行 空行)
     # ================================================================
 
-    board_start_row = last_detail_row + 3
-    ws.row_dimensions[board_start_row].height = 22
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from datetime import timedelta
 
-    # ---- 左パネル (A-E 結合): QA Expert AI Diagnosis ----
-    ws.merge_cells(f"A{board_start_row}:E{board_start_row + 1}")
-    diag_title_cell = ws.cell(
-      row=board_start_row, column=1,
-      value="QA Expert AI Anomaly Diagnosis Report",
-    )
-    diag_title_cell.font = Font(bold=True, size=11, color=WHITE, name="Calibri")
-    diag_title_cell.fill = header_fill
-    diag_title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    diag_title_cell.border = thin_border
+    chart_start_row = last_detail_row + 4
+    chart_row = chart_start_row
 
-    # AI 診断テキスト (A-E 結合, 十分な高さ)
-    diag_text_row = board_start_row + 2
-    diag_text_end_row = board_start_row + 5
-    ws.merge_cells(f"A{diag_text_row}:E{diag_text_end_row}")
-
-    ai_comment = ""
-    if ENABLE_AI_DIAGNOSIS and len(abnormal_df) > 0:
-      try:
-        top_event = abnormal_df.iloc[0]
-        raw_comment = call_datarobot_genai_diagnosis(
-          machine_no=top_event.get("Machine_No"),
-          route_key=top_event.get("ROUTE_KEY"),
-          trigger_rule=str(top_event.get("trigger_rule", "")),
-          top_explanation=str(top_event.get("top_explanation", "")),
-        )
-        if raw_comment:
-          # 3セクション形式に整形
-          ai_comment = (
-            "[Top Candidate Trends]\n"
-            f"{raw_comment}\n\n"
-            "[Graph Confirmation Points]\n"
-            "Please refer to the right-side trend graph for UCL/UWL threshold crossings and time-series behavior.\n\n"
-            "[Inspection Viewpoints]\n"
-            "1) Visually check the top explanation sensor for physical damage or drift.\n"
-            "2) Compare with neighboring machine trend to isolate process vs machine root cause.\n"
-            "3) If SENSOR_FAULT_SUPPRESSED is present, prioritize sensor health check before mechanical diagnosis."
-          )
-      except Exception as diag_err:
-        log_message(f"[EXCEL] AI diagnosis failed (non-blocking): {diag_err}")
-        ai_comment = "AI diagnosis unavailable for this batch."
-    else:
-      ai_comment = "AI diagnosis disabled. Enable ENABLE_AI_DIAGNOSIS in config_anomaly."
-
-    diag_text_cell = ws.cell(row=diag_text_row, column=1, value=ai_comment)
-    diag_text_cell.font = diag_font
-    diag_text_cell.alignment = diag_align
-    diag_text_cell.border = thin_border
-    # 診断テキスト行の高さ
-    for r in range(diag_text_row, diag_text_end_row + 1):
-      ws.row_dimensions[r].height = 45
-
-    # ---- 右パネル (F-K 結合): トレンドグラフ ----
-    ws.merge_cells(f"F{board_start_row}:K{board_start_row + 1}")
-    trend_title_cell = ws.cell(
-      row=board_start_row, column=6,
-      value="Anomaly Score & Feature Trend (Twin-Axis Time Series)",
-    )
-    trend_title_cell.font = Font(bold=True, size=11, color=WHITE, name="Calibri")
-    trend_title_cell.fill = header_fill
-    trend_title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    trend_title_cell.border = thin_border
-
-    # 画像エリア (F-K 結合, 大面積)
-    img_area_row = board_start_row + 2
-    img_area_end_row = board_start_row + 5
-    ws.merge_cells(f"F{img_area_row}:K{img_area_end_row}")
-    # 画像エリアの境界線
-    for r in range(img_area_row, img_area_end_row + 1):
-      for c in range(6, 12):
-        ws.cell(row=r, column=c).border = thin_border
-
-    # 最上位異常イベントのトレンドグラフを埋め込み
-    trend_embedded = False
+    # イベント時刻 ±4h 窓
     if len(abnormal_df) > 0:
-      top_event = abnormal_df.iloc[0]
-      trend_path = _compute_trend_graph_path(
-        top_event.get("Machine_No"),
-        top_event.get("ROUTE_KEY"),
-        top_event.get("Production_DateTime"),
-        trend_dir,
-      )
-      if trend_path and os.path.exists(trend_path):
+      top_ev = abnormal_df.iloc[0]
+      ref_dt_raw = top_ev.get("Production_DateTime")
+      ref_dt = pd.to_datetime(ref_dt_raw) if not isinstance(ref_dt_raw, pd.Timestamp) else ref_dt_raw
+    else:
+      ref_dt = ts_dt
+    win4_start = ref_dt - timedelta(hours=4)
+    win4_end   = ref_dt + timedelta(hours=4)
+    ref_mno = top_ev.get("Machine_No") if len(abnormal_df) > 0 else "N/A"
+    ref_rkey = top_ev.get("ROUTE_KEY") if len(abnormal_df) > 0 else "N/A"
+
+    # ---- 内部関数: 散布図 PNG 生成 ----
+    def _make_scatter_png(x_vals, y_vals, title_str, ylabel_str, ylim=None, hlines=None, color="#1F4E78"):
+      """純粋散布図 PNG を生成しファイルパスを返す"""
+      try:
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.scatter(x_vals, y_vals, c=color, marker=".", s=12, alpha=0.85, zorder=3)
+        ax.set_title(title_str, fontsize=9, fontweight="bold", color=DARK_BLUE)
+        ax.set_ylabel(ylabel_str, fontsize=8, color=DARK_BLUE)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.tick_params(labelsize=7)
+        if ylim:
+          ax.set_ylim(*ylim)
+        if hlines:
+          for yval, lstyle, lcolor, llabel in hlines:
+            ax.axhline(y=yval, linestyle=lstyle, color=lcolor, linewidth=0.8, label=llabel)
+          ax.legend(fontsize=7, loc="upper right")
+        fig.autofmt_xdate(rotation=20, ha="right")
+        plt.tight_layout()
+        png_path = os.path.join(trend_dir, f"_scatter_{abs(hash(title_str))}_{datetime.now().strftime(\"%f\")}.png")
+        fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return png_path
+      except Exception:
         try:
-          img = Image(trend_path)
-          # F-K 6列幅 (~420px) に合わせて原寸を配置
-          img.width = 780
-          img.height = 335
-          ws.add_image(img, f"F{img_area_row}")
-          trend_embedded = True
-        except Exception as img_err:
-          log_message(f"[EXCEL] trend image embed failed: {img_err}")
-    if not trend_embedded:
-      no_img_cell = ws.cell(
-        row=img_area_row, column=6,
-        value="Trend graph not available for this batch.\nCheck EXPLANATION_TREND_OUTPUT_SUBDIR for PNG files."
-      )
-      no_img_cell.font = Font(size=10, color="#999999", name="Calibri", italic=True)
-      no_img_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+          plt.close("all")
+        except Exception:
+          pass
+        return None
 
-    # 画像エリア行高
-    for r in range(img_area_row, img_area_end_row + 1):
-      ws.row_dimensions[r].height = 85
+    # ---- Chart 1: Anomaly_Score 純粋散布 (±4h) ----
+    try:
+      score_sql = f"""
+      SELECT Production_DateTime, anomaly_score
+      FROM {STATUS_TABLE}
+      WHERE Machine_No = ? AND route_key = ?
+        AND Production_DateTime >= ? AND Production_DateTime <= ?
+        AND anomaly_score IS NOT NULL
+      ORDER BY Production_DateTime ASC
+      """
+      with get_connection() as conn:
+        sdf = pd.read_sql(score_sql, conn, params=[ref_mno, ref_rkey, win4_start, win4_end])
+      sdf["_dt"] = pd.to_datetime(sdf["Production_DateTime"])
+      sdf["_s"] = pd.to_numeric(sdf["anomaly_score"], errors="coerce")
+      sdf = sdf.dropna(subset=["_dt", "_s"])
+      if len(sdf) > 0:
+        hlines = [
+          (ANOMALY_UCL, "--", "red", f"UCL={ANOMALY_UCL}"),
+          (ANOMALY_UWL, "--", "orange", f"UWL={ANOMALY_UWL}"),
+        ]
+        png1 = _make_scatter_png(
+          sdf["_dt"], sdf["_s"],
+          f"Anomaly Score Scatter | M={ref_mno} R={ref_rkey} | ±4h",
+          "Anomaly Score", ylim=(0.0, 1.0), hlines=hlines,
+        )
+        if png1 and os.path.exists(png1):
+          ws.merge_cells(f"A{chart_row}:K{chart_row}")
+          ws.cell(row=chart_row, column=1, value="Chart 1: Anomaly Score Scatter (±4h)").font = Font(bold=True, size=10, color=DARK_BLUE)
+          chart_row += 1
+          for rr in range(chart_row, chart_row + 6):
+            ws.row_dimensions[rr].height = 48
+          ws.merge_cells(f"A{chart_row}:K{chart_row + 5}")
+          img1 = Image(png1)
+          img1.width = 960
+          img1.height = 360
+          ws.add_image(img1, f"A{chart_row}")
+          chart_row += 6
+    except Exception as e1:
+      log_message(f"[EXCEL] Chart-1 scatter failed: {e1}")
+
+    # ---- 動的チャート: Top Explanation 特徴量ごとの物理値散布図 ----
+    if "top_explanation" in abnormal_df.columns:
+      unique_features = abnormal_df["top_explanation"].dropna().unique()
+    else:
+      unique_features = []
+
+    chart_idx = 1
+    for feat_name in unique_features:
+      fname = str(feat_name).strip()
+      if not fname:
+        continue
+      chart_idx += 1
+      try:
+        # View1 から該当特徴量の時系列を取得
+        col_candidates = [fname, fname.replace("-", "_")]
+        fdf = pd.DataFrame()
+        for col_try in col_candidates:
+          try:
+            fsql = f"SELECT Production_DateTime, [{col_try}] AS _fv FROM {ANOMALY_HISTORICAL_FEATURE_VIEW} WHERE Machine_No = ? AND ROUTE_KEY = ? AND Production_DateTime >= ? AND Production_DateTime <= ? ORDER BY Production_DateTime ASC"
+            with get_connection() as conn:
+              fdf = pd.read_sql(fsql, conn, params=[ref_mno, ref_rkey, win4_start, win4_end])
+            if not fdf.empty and "_fv" in fdf.columns:
+              break
+          except Exception:
+            continue
+
+        if fdf.empty or "_fv" not in fdf.columns:
+          continue
+
+        fdf["_dt"] = pd.to_datetime(fdf["Production_DateTime"])
+        fdf["_fv"] = pd.to_numeric(fdf["_fv"], errors="coerce")
+        fdf = fdf.dropna(subset=["_dt", "_fv"])
+        if len(fdf) == 0:
+          continue
+
+        png_f = _make_scatter_png(
+          fdf["_dt"], fdf["_fv"],
+          f"Chart {chart_idx}: {fname} Raw Value Scatter | M={ref_mno} R={ref_rkey} | ±4h",
+          f"{fname} (raw)", color="#D44500",
+        )
+        if png_f and os.path.exists(png_f):
+          ws.merge_cells(f"A{chart_row}:K{chart_row}")
+          ws.cell(row=chart_row, column=1, value=f"Chart {chart_idx}: {fname} Raw Feature Scatter").font = Font(bold=True, size=10, color=DARK_BLUE)
+          chart_row += 1
+          for rr in range(chart_row, chart_row + 6):
+            ws.row_dimensions[rr].height = 48
+          ws.merge_cells(f"A{chart_row}:K{chart_row + 5}")
+          img_f = Image(png_f)
+          img_f.width = 960
+          img_f.height = 360
+          ws.add_image(img_f, f"A{chart_row}")
+          chart_row += 6
+      except Exception as ef:
+        log_message(f"[EXCEL] Chart-{chart_idx} scatter failed for {fname}: {ef}")
 
     # ================================================================
-    # シート全体の微調整
+    # 仕上げ
     # ================================================================
-    # F-K 列の標準幅
-    for ci in range(6, 12):
-      ws.column_dimensions[get_column_letter(ci)].width = 18
-
-    # 印刷設定
     ws.sheet_properties.pageSetUpPr = None
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
 
-    # ---- 保存 ----
     wb.save(output_path)
 
     log_message(
-      f"[EXCEL] dashboard saved path={output_path} "
+      f"[EXCEL] dashboard v3 saved path={output_path} "
       f"total={len(merged_df)} "
       f"abnormal={len(abnormal_df)} "
-      f"trend_embedded={trend_embedded} "
-      f"ai_diag={bool(ai_comment and ai_comment != \"AI diagnosis disabled\")}"
+      f"scatter_charts={chart_idx}"
     )
     return output_path
 
   except Exception as e:
     log_message(f"[EXCEL] report generation failed (non-blocking): {e}")
     log_message(traceback.format_exc())
+    try:
+      import matplotlib.pyplot as _plt
+      _plt.close("all")
+    except Exception:
+      pass
     return None
 
 
